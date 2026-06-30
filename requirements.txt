@@ -1,0 +1,15 @@
+# SQLite Task Board - Python dependencies
+# Install with: python -m pip install -r requirements.txt
+
+# Core dependency for config.yaml parsing (used in agent.py --check)
+PyYAML>=6.0
+
+# Optional: for enhanced SQLite performance and typing
+# pysqlite3-binary>=0.5.0
+
+# Optional: for testing
+# pytest>=7.0
+# pytest-cov>=4.0
+
+# Note: All other modules used (sqlite3, argparse, pathlib, subprocess)
+# are part of Python 3.9+ standard library
