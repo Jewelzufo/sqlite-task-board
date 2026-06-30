@@ -1,89 +1,181 @@
-# sqlite-task-board
+# SQLite Task Board Opencode Bootstrap
 
-A single-agent SQLite task board with schema-validated payloads, structured crash recovery, and a zero-trust security model. Designed to be read by [Opencode](https://opencode.ai) as its operating manual via `AGENTS.md`.
+*A minimal local bootstrap framework for running one autonomous Opencode execution agent from a SQLite task queue.*
 
-[AGENTS.md](https://github.com/Jewelzufo/taskboard-agent/blob/main/AGENTS.md)
-
----
-
-## What it is
-
-A lightweight task queue where one agent works through a prioritised list of JSON instructions stored in a local SQLite database. Each task is validated against a strict JSON Schema, executed inside a security sandbox, and logged to stdout as JSONL. Failed tasks retry up to a configurable limit before being dead-lettered.
-
-**Five task states:** `pending → running → completed / failed / dead-lettered`
-
-**Five built-in actions:** `verify_runtime` · `create_directories` · `setup_env_file` · `install_dependencies` · `run_health_check`
+Point Opencode at **`AGENTS.md`**, and the agent configures the project itself.
 
 ---
 
-## Quick start
+## What It Does
+
+This framework turns a single **`AGENTS.md`** file into a working local agent runtime. The agent will:
+
+1. Read **`AGENTS.md`** as the source of truth.
+2. Create **`opencode.json`** first so future Opencode sessions load the same instructions.
+3. Generate the required project scaffold.
+4. Create local configuration files.
+5. Initialize a SQLite **`tasks.db`**.
+6. Seed the first task queue.
+7. Validate the runtime.
+8. Begin executing work from the SQLite queue.
+
+After bootstrap, normal work flows through the task board instead of ad hoc commands.
+
+---
+
+## Project Structure
+
+```
+sqlite-task-board/
+├── AGENTS.md
+├── README.md
+├── opencode.json
+├── agent.py
+├── config.example.yaml
+├── config.yaml
+├── requirements.txt
+├── .gitignore
+├── migrations/
+│   └── 0001_initial.sql
+├── seeds/
+│   └── bootstrap_tasks.sql
+├── tests/
+│   └── test_agent_contract.py
+└── workspace/
+    └── .gitkeep
+```
+
+---
+
+## Core Files
+
+| File | Purpose |
+|------|---------|
+| **`AGENTS.md`** | Primary bootstrap and runtime protocol |
+| **`opencode.json`** | Tells Opencode to load **`AGENTS.md`** |
+| **`agent.py`** | Runtime entry point |
+| **`tasks.db`** | SQLite task board |
+| **`migrations/0001_initial.sql`** | Database schema |
+| **`seeds/bootstrap_tasks.sql`** | Initial bootstrap queue |
+| **`workspace/`** | Safe writable task area |
+
+---
+
+## How It Works
+
+```mermaid
+graph TD
+    A[User points Opencode at AGENTS.md] --> B[Agent creates opencode.json]
+    B --> C[Agent builds scaffold]
+    C --> D[Agent initializes tasks.db]
+    D --> E[Agent seeds task queue]
+    E --> F[Agent validates setup]
+    F --> G[Agent executes queued tasks]
+```
+
+---
+
+## Task Queue Model
+
+### Lifecycle
+
+Tasks move through a simple lifecycle:
+
+```
+pending → running → completed
+                 → pending (retryable failure)
+                 → dead-lettered (final failure)
+```
+
+### Priority Order
+
+1. **critical**
+2. **high**
+3. **medium**
+4. **low**
+
+The default bootstrap queue includes safe local actions such as:
+- Runtime verification
+- Workspace directory creation
+- Placeholder health-check validation
+
+---
+
+## Security Defaults
+
+The framework is designed for **local, controlled execution** and enforces the following:
+
+| Area | Control |
+|------|---------|
+| **Filesystem** | Task writes stay inside **`workspace/`** |
+| **Paths** | Path traversal and unsafe absolute paths are rejected |
+| **Subprocesses** | Uses **`shell=False`** only |
+| **Network** | Allows only **`http`** or **`https`** to allowlisted local hosts |
+| **Secrets** | No real secrets are written or logged |
+| **Validation** | Every task payload must match a strict schema |
+
+---
+
+## Optional Manual Commands
+
+The agent can bootstrap itself, so manual commands are optional.
+
+### Install Dependencies
 
 ```bash
-cp config.example.yaml config.yaml      # set workspace, database, and security paths
+python -m pip install -r requirements.txt
+```
+
+### Initialize SQLite Manually
+
+```bash
 sqlite3 tasks.db < migrations/0001_initial.sql
+sqlite3 tasks.db < seeds/bootstrap_tasks.sql
+```
+
+### Validate
+
+```bash
+python -m py_compile agent.py
+python agent.py --check
+```
+
+### Run One Queued Task
+
+```bash
+python agent.py --once
+```
+
+### Run Continuously
+
+```bash
 python agent.py
-
-# Dry-run (reads normally, all writes rolled back)
-AGENT_DRY_RUN=true python agent.py
 ```
 
 ---
 
-## Repository layout
+## Runtime Modes
 
-```
-AGENTS.md                  # full operating manual — read by Opencode at session start
-config.example.yaml        # annotated configuration template
-agent.py                   # agent entry point
-migrations/
-  0001_initial.sql         # baseline schema
-```
-
----
-
-## Key behaviours
-
-**Crash recovery.** On startup the agent scans for any `running` tasks left by a previous interrupted session. Tasks with attempts remaining are requeued; exhausted tasks are dead-lettered.
-
-**Idempotency.** Every task carries an `idempotency_key`. If a completed task shares a key with an incoming one, the new task is marked complete immediately without re-executing.
-
-**Security sandbox.** All filesystem writes are confined to `security.workspace_boundary`. Network endpoints are checked against an explicit allowlist. Subprocesses never run with `shell=True`. The agent refuses to start as root.
-
-**Queue replenishment.** When the pending queue empties the agent injects a new batch (default: 10 tasks) before looping, up to a configurable daily cap.
-
-**Structured logging.** Every lifecycle event emits a JSONL line to stdout with `timestamp` and `event` as minimum fields.
+| Command | Purpose |
+|---------|---------|
+| `python agent.py --check` | Validate configuration and runtime readiness |
+| `python agent.py --once` | Execute one queued task |
+| `python agent.py` | Run the continuous task loop |
+| `AGENT_DRY_RUN=true python agent.py --once` | Validate and plan without persisting task changes |
 
 ---
 
-## Adding an action
+## Acceptance Criteria
 
-1. Define a JSON Schema in `AGENTS.md §6` with `additionalProperties: false` and a required `idempotency_key`.
-2. Implement a handler returning `{'success': bool, 'error_code'?: str, 'error_message'?: str}`.
-3. Apply security checks (path, network, subprocess) before any side effects.
-4. Register the handler in `ACTION_REGISTRY` in `agent.py`.
-
----
-
-## Configuration reference
-
-| Key | Default | Purpose |
-|---|---|---|
-| `agent.workspace` | — | Writable working directory |
-| `agent.database` | — | SQLite database path |
-| `task_board.max_attempts_default` | `3` | Retries before dead-lettering |
-| `task_board.replenishment_batch_size` | `10` | Tasks injected per replenishment cycle |
-| `task_board.max_generated_per_day` | `50` | Daily replenishment cap |
-| `security.workspace_boundary` | — | Filesystem write boundary |
-| `security.network_allowlist` | — | Permitted hosts/CIDRs |
-
-See `config.example.yaml` and `AGENTS.md §2` for the full schema.
+Bootstrap is complete when:
+- The scaffold exists
+- **`opencode.json`** references **`AGENTS.md`**
+- **`tasks.db`** is initialized
+- Bootstrap tasks are seeded
+- `python agent.py --check` passes
 
 ---
 
-## Schema migrations
+## Summary
 
-Add a file under `migrations/`, include a version row in `schema_migrations`, apply it manually, then update the expected version constant in `agent.py`. The agent hard-exits on a version mismatch — it never auto-migrates.
-
----
-
-**Schema Version:** 1 · **Protocol Version:** 3.0 · **License:** MIT
+This project provides a **compact SQLite-backed execution harness** for one autonomous Opencode agent. The user only points Opencode at **`AGENTS.md`**, and the agent builds, validates, and runs the local task-board system from there.
