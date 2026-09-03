@@ -1,0 +1,30 @@
+agent:
+  workspace: "./workspace"
+  database: "./tasks.db"
+  schema_version: 1
+  protocol_version: "3.1"
+
+task_board:
+  max_attempts_default: 3
+  replenishment_batch_size: 10
+  max_generated_per_day: 50
+  claim_limit: 1
+
+security:
+  workspace_boundary: "./workspace"
+  readonly_paths:
+    - "."
+  network_allowlist:
+    - "127.0.0.1"
+    - "localhost"
+  package_managers:
+    - "pip"
+    - "uv"
+    - "npm"
+  internal_registries: []
+  allow_public_registries: false
+
+logging:
+  level: "INFO"
+  format: "jsonl"
+  output: "stdout"
