@@ -2,14 +2,13 @@
 # Install with: python -m pip install -r requirements.txt
 
 # Core dependency for config.yaml parsing (used in agent.py --check)
-PyYAML>=6.0
+pyyaml>=6.0.0
 
-# Optional: for enhanced SQLite performance and typing
-# pysqlite3-binary>=0.5.0
+# JSON schema validation for action payloads
+jsonschema>=4.0.0
 
-# Optional: for testing
-# pytest>=7.0
-# pytest-cov>=4.0
+# Testing framework
+pytest>=8.0.0
 
-# Note: All other modules used (sqlite3, argparse, pathlib, subprocess)
+# Note: All other modules used (sqlite3, argparse, pathlib, subprocess, urllib)
 # are part of Python 3.9+ standard library

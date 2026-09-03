@@ -1,26 +1,30 @@
--- bootstrap_tasks.sql
--- SQLite Task Board - Initial Bootstrap Queue
--- These tasks verify the runtime after first migration
+BEGIN;
 
--- Clear any existing bootstrap tasks (idempotent re-seed)
-DELETE FROM tasks WHERE type IN ('health_check', 'ensure_workspace', 'file_write') AND json_extract(payload, '$.bootstrap') = 1;
+INSERT OR IGNORE INTO tasks (instruction, action_type, idempotency_key, status, priority, max_attempts)
+VALUES
+  (
+    '{"action":"verify_runtime","language":"python","min_version":"3.11","idempotency_key":"bootstrap-verify-python-311"}',
+    'verify_runtime',
+    'bootstrap-verify-python-311',
+    'pending',
+    'critical',
+    3
+  ),
+  (
+    '{"action":"create_directories","paths":["./workspace/logs","./workspace/data","./workspace/tmp"],"idempotency_key":"bootstrap-create-workspace-dirs"}',
+    'create_directories',
+    'bootstrap-create-workspace-dirs',
+    'pending',
+    'high',
+    3
+  ),
+  (
+    '{"action":"run_health_check","endpoint":"http://127.0.0.1:0/health","timeout_seconds":1,"idempotency_key":"bootstrap-health-placeholder"}',
+    'run_health_check',
+    'bootstrap-health-placeholder',
+    'pending',
+    'low',
+    1
+  );
 
--- 1. Critical health check (startup)
-INSERT INTO tasks (type, payload, priority, status, max_attempts)
-VALUES ('health_check', '{"check":"startup","bootstrap":1}', 'critical', 'pending', 1);
-
--- 2. Ensure workspace directory exists
-INSERT INTO tasks (type, payload, priority, status, max_attempts)
-VALUES ('ensure_workspace', '{"bootstrap":1}', 'critical', 'pending', 3);
-
--- 3. Write bootstrap confirmation file (tests file_write security)
-INSERT INTO tasks (type, payload, priority, status, max_attempts)
-VALUES ('file_write', '{"path":"bootstrap/hello.txt","content":"SQLite Task Board bootstrapped successfully.\nWorkspace writes are confined and validated.\n","bootstrap":1}', 'high', 'pending', 2);
-
--- 4. Run a safe shell command (tests subprocess allowlist)
-INSERT INTO tasks (type, payload, priority, status, max_attempts)
-VALUES ('shell', '{"cmd":["python","-c","print(\"agent ok\")"],"bootstrap":1}', 'high', 'pending', 2);
-
--- 5. Final health check (post-bootstrap validation)
-INSERT INTO tasks (type, payload, priority, status, max_attempts)
-VALUES ('health_check', '{"check":"post_bootstrap","bootstrap":1}', 'medium', 'pending', 1);
+COMMIT;
