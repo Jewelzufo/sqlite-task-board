@@ -108,7 +108,7 @@ python -m pytest --cov=agent --cov-fail-under=80
 ruff check .
 ```
 
-CI runs Python 3.11 and 3.12, linting, coverage, and the init/check/status smoke test. Copy `docs/ci-workflow.yml` to `.github/workflows/ci.yml` where workflow permissions allow; `scripts/ci.sh` runs the same checks locally.
+`docs/ci-workflow.yml` runs Python 3.11 and 3.12, linting, coverage, and the init/check/status smoke test once copied to `.github/workflows/ci.yml`; `scripts/ci.sh` runs the same checks locally.
 
 ## Operations and troubleshooting
 
