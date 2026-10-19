@@ -3,7 +3,7 @@
   "instructions": ["AGENTS.md"],
   "permission": {
     "edit": "allow",
-    "bash": "ask",
+    "bash": "allow",
     "webfetch": "ask"
   },
   "formatter": {

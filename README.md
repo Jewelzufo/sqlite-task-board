@@ -1,369 +1,124 @@
 # SQLite Task Board for OpenCode
 
-> A local, zero-trust task queue that bootstraps and runs one autonomous OpenCode execution agent with Python and SQLite.
-
-![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-local-003B57?logo=sqlite&logoColor=white)
-![Schema](https://img.shields.io/badge/schema-v1-4C1)
-![Protocol](https://img.shields.io/badge/protocol-v3.1-4C1)
+> A local, zero-trust task queue for one autonomous OpenCode execution agent, backed by Python and SQLite.
 
 ## Overview
 
-This project implements a small, local task board for a single autonomous execution agent. SQLite is the source of task state, [`AGENTS.md`](./AGENTS.md) is the operating contract, and [`agent.py`](./agent.py) is the runtime entry point.
+SQLite is the source of task state, [`AGENTS.md`](./AGENTS.md) is the operating contract, and [`agent.py`](./agent.py) is the runtime. Point OpenCode at `AGENTS.md`; it creates the scaffold, initializes `tasks.db`, seeds the queue, and starts processing work.
 
-The user only needs to direct OpenCode to `AGENTS.md`. The agent then creates the project scaffold, initializes `tasks.db`, seeds the first task queue, validates the runtime, and begins processing queued work without requiring manual setup.
+- Tasks are JSON instructions in SQLite.
+- Payloads pass strict action-specific JSON Schema validation.
+- Only registered actions execute.
+- Writes stay inside `workspace/`; subprocesses use `shell=False` and timeouts.
+- Network requests require an allowlisted host and `http`/`https`.
+- Lifecycle and error events are JSONL on stdout.
+- Failed work is retried, then dead-lettered.
+- Claiming is atomic and safe for one worker by default.
 
-The design favors predictable execution over unrestricted autonomy:
+## Quick start
 
-- Tasks are stored as JSON instructions in SQLite.
-- Payloads must pass strict, action-specific JSON Schema validation.
-- Only registered actions can execute.
-- Task writes are constrained to `workspace/` after bootstrap.
-- Subprocesses use argument lists, timeouts, and `shell=False`.
-- Network requests are denied unless their protocol and host are allowed.
-- Lifecycle and error events are emitted as structured JSONL.
-- Failed work is retried up to its configured limit, then dead-lettered.
-
-## Autonomous bootstrap
-
-Point OpenCode at the repository's `AGENTS.md` file:
-
-```text
-Read AGENTS.md completely and follow its autonomous bootstrap protocol.
+```bash
+python -m venv .venv && . .venv/bin/activate
+python -m pip install -e '.[dev]'
+taskboard init && taskboard check && taskboard status
+taskboard --once
 ```
 
-OpenCode performs the following sequence:
-
-1. Resolves the repository root from the location of `AGENTS.md`.
-2. Creates `opencode.json` first so future sessions automatically load the protocol.
-3. Creates the required directories and scaffold files.
-4. Writes safe, repository-relative configuration defaults.
-5. Runs `python agent.py --init`, which applies the migration, seeds the task queue, and creates workspace directories.
-6. Compiles and checks the runtime.
-7. Runs the static contract tests when `pytest` is available.
-8. Claims and executes the first queued task.
-
-No network access or secrets are required during bootstrap.
+Without installation, use `python agent.py --init|--check|--status|--once`. `--init` is idempotent: it applies the migration, seeds three bootstrap tasks, and creates `workspace/logs`, `workspace/data`, and `workspace/tmp`.
 
 ## Project layout
 
 ```text
-sqlite-task-board/
-├── AGENTS.md                      # Source of operating instructions
-├── README.md                      # Project and operator documentation
-├── opencode.json                  # OpenCode project configuration
-├── agent.py                       # Runtime entry point
-├── config.yaml                    # Single canonical configuration
-├── requirements.txt               # Runtime and test dependencies
-├── .gitignore
-├── migrations/
-│   └── 0001_initial.sql           # Initial task-board schema
-├── seeds/
-│   └── bootstrap_tasks.sql        # Initial task queue
-├── tests/
-│   └── test_agent_contract.py     # Offline scaffold contract tests
-└── workspace/
-    └── .gitkeep                   # Default task write boundary
+AGENTS.md  README.md  opencode.json  agent.py  config.yaml
+pyproject.toml  requirements.txt  Makefile  CHANGELOG.md
+docs/reference.md  migrations/0001_initial.sql  seeds/bootstrap_tasks.sql
+tests/test_agent_contract.py  tests/test_behavior.py  workspace/.gitkeep
 ```
 
-`workspace/` contains disposable task output. It is the only default writable location for ordinary task execution and can be deleted and recreated safely.
+`workspace/` is disposable task output and the only writable location for ordinary execution.
 
 ## How execution works
 
-Each row in the `tasks` table contains an action type, a JSON instruction, priority, retry counters, status, and lifecycle timestamps. The agent recovers interrupted work at startup, claims one eligible task, validates it, enforces security policy, executes it, and records the result.
+Each task row contains an action type, JSON instruction, priority, retry counters, status, and timestamps. The agent recovers interrupted work, atomically claims the oldest highest-priority pending task, validates its payload and security policy, executes it, and records completion, retry, or dead-letter state.
 
-```mermaid
-stateDiagram-v2
-    state "dead-lettered" as dead_lettered
-    [*] --> pending
-    pending --> running: claim by priority
-    running --> completed: success
-    running --> pending: retriable failure
-    running --> dead_lettered: attempts exhausted
-    completed --> [*]
-    dead_lettered --> [*]
+```text
+pending -> running -> completed
+                 -> pending        retriable failure
+                 -> dead-lettered  final failure
 ```
 
-Tasks are claimed in this order:
+Priority order: `critical` → `high` → `medium` → `low`.
 
-1. Priority: `critical`, `high`, `medium`, then `low`
-2. Oldest `created_at`
-3. Lowest task `id`
+## Actions
 
-The claim update is guarded by a `status='pending'` check so a task cannot be claimed twice after it leaves `pending`.
+| Action | Purpose |
+|---|---|
+| `verify_runtime` | Verifies Python meets `min_version` (patch-aware) |
+| `create_directories` | Creates pre-validated directories under `workspace/` |
+| `run_health_check` | Checks an allowlisted `http`/`https` endpoint |
 
-## Registered actions
+The bootstrap health check targets `http://127.0.0.1:0/health`; its failure is intentional. Full schemas are in [`docs/reference.md`](./docs/reference.md).
 
-The initial runtime exposes a deliberately small action surface.
+## Security controls
 
-| Action | Purpose | Primary controls |
-| --- | --- | --- |
-| `verify_runtime` | Confirm a supported runtime meets a minimum version | Fixed language enum, strict version format, subprocess timeout |
-| `create_directories` | Create one or more directories | Workspace boundary, path traversal rejection, item limits |
-| `run_health_check` | Check an allowed HTTP or HTTPS endpoint | Protocol allowlist, host allowlist, short timeout |
-
-Every payload must:
-
-- Match the schema for its declared action.
-- Include an `idempotency_key`.
-- Contain no undeclared properties.
-- Pass action registration and security-policy checks.
-
-## Bootstrap queue
-
-The initial seed creates three idempotent tasks:
-
-| Priority | Action | Expected result |
-| --- | --- | --- |
-| `critical` | Verify Python 3.11 or newer | Completes when the runtime requirement is met |
-| `high` | Create `workspace/logs`, `workspace/data`, and `workspace/tmp` | Completes within the workspace boundary |
-| `low` | Check `http://127.0.0.1:0/health` | Fails cleanly and exercises final-failure handling |
-
-The port `0` health check is intentionally unreachable. Its failure verifies error reporting and dead-letter behavior; it does not indicate a broken installation.
-
-## Requirements
-
-- Python 3.11 or newer
-- SQLite, through Python's built-in `sqlite3` module
-- [PyYAML](https://pypi.org/project/PyYAML/) 6.0 or newer
-- [jsonschema](https://pypi.org/project/jsonschema/) 4.0 or newer
-- [pytest](https://pypi.org/project/pytest/) 8.0 or newer for tests
-
-The standalone `sqlite3` CLI is optional. When it is unavailable, bootstrap uses Python's standard-library SQLite support.
-
-## Optional manual setup
-
-Autonomous bootstrap is the primary workflow. These commands are provided for development, recovery, and inspection.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-Initialize the database, seed the bootstrap queue, and create workspace directories:
-
-```bash
-python agent.py --init
-```
-
-The initializer is idempotent. Re-running it does not duplicate tasks. If the `sqlite3` CLI is preferred, apply the same files in order:
-
-```bash
-sqlite3 tasks.db < migrations/0001_initial.sql
-sqlite3 tasks.db < seeds/bootstrap_tasks.sql
-```
-
-## Running the agent
-
-Initialize the database and seed the queue on first run:
-
-```bash
-python agent.py --init
-```
-
-Validate configuration, schema compatibility, and runtime readiness:
-
-```bash
-python agent.py --check
-```
-
-Show queue counts and the next eligible task:
-
-```bash
-python agent.py --status
-```
-
-Claim and process at most one task:
-
-```bash
-python agent.py --once
-```
-
-Run continuously until interrupted:
-
-```bash
-python agent.py
-```
-
-Preview execution without performing task mutations:
-
-```bash
-AGENT_DRY_RUN=true python agent.py --once
-```
-
-Use an alternate configuration file:
-
-```bash
-AGENT_CONFIG=./path/to/config.yaml python agent.py --check
-```
+- Writes resolve beneath `agent.workspace`; absolute paths and `..` are rejected.
+- All directory paths are validated before any directory is created.
+- Payloads use `additionalProperties: false` and a `FormatChecker`.
+- Subprocesses use list arguments, `shell=False`, timeouts, a minimal environment, and truncated output.
+- Health checks require `http`/`https` and an exact host allowlist match; redirects are rejected.
+- Sensitive keys and `key=value` patterns are redacted from events and errors.
+- No secrets are required or written by bootstrap.
 
 ## Configuration
 
-`config.yaml` is the single configuration file and contains no secrets. Every key is read by the runtime; there is no separate example file.
+```yaml
+agent:
+  workspace: "./workspace"
+  database: "./tasks.db"
+  schema_version: 1
+  protocol_version: "3.1"
 
-| Section | Controls |
-| --- | --- |
-| `agent` | Workspace, database path, schema version, and protocol version |
-| `security` | Network allowlist for `run_health_check` |
-
-Repository-relative paths are resolved from the repository root. `--check` emits `SCHEMA_VERSION_MISMATCH` and fails when `agent.schema_version` differs from the applied migration.
-
-## Security model
-
-Ordinary task execution uses zero-trust defaults.
-
-### Filesystem
-
-- Bootstrap may create scaffold files only under the repository root.
-- After bootstrap, task writes must remain inside `agent.workspace`.
-- `..` traversal and absolute paths outside the workspace are rejected.
-- Referenced files are checked before use.
-
-### Subprocesses
-
-- Commands are passed as argument lists with `shell=False`.
-- Subprocess calls use a bounded timeout.
-
-### Network
-
-- Only HTTP and HTTPS endpoints are accepted.
-- The destination host must match `security.network_allowlist`.
-- Bootstrap itself remains offline.
-
-### Secrets
-
-- Real secrets are never written into generated environment files.
-- Sensitive keys are redacted before logging.
-- Keys containing `password`, `secret`, `token`, `credential`, `api_key`, or `key` are treated as sensitive.
-
-## Structured logging
-
-The agent writes one JSON object per line to standard output. Every event contains a UTC `timestamp` and an `event` name. Task-scoped events also contain `task_id`.
-
-```jsonl
-{"timestamp":"2026-01-01T10:00:00Z","event":"STARTUP","protocol_version":"3.1"}
-{"timestamp":"2026-01-01T10:00:01Z","event":"SCHEMA_CHECK_OK","schema_version":1}
-{"timestamp":"2026-01-01T10:00:02Z","event":"EXEC_START","task_id":1,"action":"verify_runtime","attempt":1}
-{"timestamp":"2026-01-01T10:00:03Z","event":"EXEC_END","task_id":1,"action":"verify_runtime","status":"completed"}
+security:
+  network_allowlist: ["127.0.0.1", "localhost"]
 ```
 
-Required lifecycle events include configuration failures, initialization, startup, schema checks, execution, dead-lettering, and graceful shutdown.
+Relative paths resolve from the repository root. `AGENT_CONFIG` selects an alternate file. `agent.schema_version` must equal `1`; `security.network_allowlist` must be a non-empty list of hosts.
 
-## Retry and recovery
+## Commands
 
-At startup, interrupted `running` tasks are recovered before new work is claimed:
+| Command | Description |
+|---|---|
+| `taskboard --init` | Migrate, seed, and create workspace directories |
+| `taskboard --check` | Validate dependencies, config, workspace, database, and schema |
+| `taskboard --status [--json]` | Show queue counts and the next task |
+| `taskboard --once [--dry-run]` | Execute or plan one task |
+| `taskboard` | Run the continuous worker |
 
-- A task below its maximum attempt count returns to `pending`.
-- A task at its maximum attempt count becomes `dead-lettered` with `INTERRUPTED_MAX_ATTEMPTS_EXCEEDED`.
+`--once` exit codes: `0` success, `1` task failure, `2` no pending work.
 
-Normal failures follow the same retry boundary:
+## Dry run
 
-- `attempt_count < max_attempts` returns the task to `pending`.
-- `attempt_count >= max_attempts` moves the task to `dead-lettered`.
+`AGENT_DRY_RUN=true taskboard --once` or `taskboard --once --dry-run` selects and validates the next task without claiming it, creates no files, makes no network requests, and performs no database writes. It emits `EXEC_PLAN` and leaves the task pending.
 
-Protocol 3.1 does not require a delay between retries.
-
-## Inspecting the task board
-
-View the queue with the SQLite CLI:
-
-```bash
-sqlite3 -header -column tasks.db \
-  "SELECT id, priority, action_type, status, attempt_count, max_attempts, error_code FROM tasks ORDER BY id;"
-```
-
-Inspect recent failures:
+## Tests and CI
 
 ```bash
-sqlite3 -header -column tasks.db \
-  "SELECT id, action_type, status, error_code, error_message, failed_at FROM tasks WHERE status IN ('failed', 'dead-lettered') ORDER BY updated_at DESC;"
-```
-
-Treat direct database edits as an administrative recovery tool. Normal work should enter and progress through the queue so validation, idempotency, retries, and logging remain intact.
-
-## Validation and tests
-
-Run all offline validation checks:
-
-```bash
-python -m py_compile agent.py
-python agent.py --check
 python -m pytest tests
+python -m pytest --cov=agent --cov-fail-under=80
+ruff check .
 ```
 
-The static contract tests confirm that required files exist, `opencode.json` references `AGENTS.md`, migrations create the expected tables, bootstrap tasks are seeded, and `agent.py` exposes `ACTION_REGISTRY`.
+CI runs Python 3.11 and 3.12, linting, coverage, and the init/check/status smoke test.
 
-No test requires external network access.
+## Operations and troubleshooting
 
-## Common errors
+- SQLite is authoritative; `tasks.db` is generated and ignored by Git.
+- `AGENTS.md` is authoritative if documentation conflicts; `workspace/` output is disposable.
+- Queue replenishment is not implemented; enqueue work explicitly. Logs are JSONL on stdout; human progress goes to stderr.
+- Missing PyYAML/jsonschema: run `python -m pip install -r requirements.txt`; the runtime fails closed.
+- Task stuck in `running`: restart the agent; recovery returns it to `pending` or dead-letters it.
+- Health check failure is expected for the bootstrap port `0` endpoint. Extend only the narrowest allowlist or workspace setting for real work.
 
-| Error code | Meaning | Suggested action |
-| --- | --- | --- |
-| `CONFIG_LOAD_FAILED` | Configuration could not be loaded | Install dependencies and validate `config.yaml` syntax |
-| `SCHEMA_VERSION_MISMATCH` | Configured and applied schema versions differ | Apply the expected migration or restore the matching configuration |
-| `INVALID_JSON` | Task instruction is not valid JSON | Correct the queued instruction |
-| `SCHEMA_VALIDATION_FAILED` | Payload does not match its strict action schema | Remove unsupported fields and supply all required values |
-| `UNKNOWN_ACTION` | Action is not in `ACTION_REGISTRY` | Register and test the action before queuing it |
-| `PATH_OUTSIDE_WORKSPACE` | A task attempted an out-of-bound write | Use a path under the configured workspace |
-| `PATH_TRAVERSAL_ATTEMPT` | A path contains unsafe traversal | Replace it with a normalized workspace-relative path |
-| `UNAPPROVED_HOST` | Network host is not allowlisted | Add an explicitly reviewed host or change the endpoint |
-| `UNAPPROVED_PROTOCOL` | URL does not use HTTP or HTTPS | Use an allowed protocol |
-| `PROCESS_TIMEOUT` | A subprocess exceeded its limit | Diagnose the command or adjust its bounded timeout |
-| `MAX_ATTEMPTS_EXCEEDED` | The task exhausted its retries | Inspect its logged error and enqueue a corrected task |
+## License
 
-## Adding an action
-
-New capabilities should preserve the same narrow execution model:
-
-1. Define a strict JSON Schema with `additionalProperties: false`.
-2. Require a valid `idempotency_key`.
-3. Implement the action with explicit filesystem, process, and network checks.
-4. Register the handler in `ACTION_REGISTRY`.
-5. Add offline tests for valid, invalid, and adversarial payloads.
-6. Document the action, side effects, and recovery behavior.
-7. Queue work through SQLite instead of calling the handler directly.
-
-Do not weaken global policy to accommodate one action. Extend the smallest relevant allowlist or schema and keep the change reviewable.
-
-## Operational notes
-
-- SQLite is the authoritative task-state store.
-- `AGENTS.md` is the authoritative protocol document.
-- `config.yaml` intentionally remains in version control because its defaults contain no secrets.
-- Database files, runtime output, virtual environments, editor metadata, and local secret files are ignored by Git.
-- `workspace/.gitkeep` preserves the writable workspace directory without committing task output.
-- Queue replenishment is not implemented in this version; enqueue work explicitly.
-
-## Troubleshooting
-
-### PyYAML or jsonschema is missing
-
-Install the declared dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-The runtime fails closed when safe configuration loading or schema validation is unavailable.
-
-### `sqlite3` is not installed
-
-Use the Python initialization snippet above. The runtime itself uses Python's built-in `sqlite3` module and does not require the CLI.
-
-### A task remains in `running`
-
-Restart the agent. Startup recovery returns the task to `pending` when attempts remain, or dead-letters it when its attempt limit has been reached.
-
-### The bootstrap health check fails
-
-This is expected. The seeded endpoint uses local port `0` specifically to exercise controlled failure and dead-letter handling.
-
-### A legitimate path or host is blocked
-
-Review the task and extend the narrowest relevant setting in `config.yaml`. Avoid broad workspace roots, wildcard network access, or public registry access unless the risk is explicitly accepted.
-
-## Source of truth
-
-This README is an operator guide. If it conflicts with [`AGENTS.md`](./AGENTS.md), the protocol in `AGENTS.md` takes precedence.
+MIT. See [`LICENSE`](./LICENSE).
