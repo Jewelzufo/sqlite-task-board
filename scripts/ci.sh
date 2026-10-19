@@ -5,3 +5,4 @@ python -m pytest --cov=agent --cov-fail-under=80
 python agent.py --init
 python agent.py --check
 python agent.py --status
+python agent.py --audit-verify

@@ -25,6 +25,7 @@ jobs:
         run: pytest --cov=agent --cov-fail-under=80
       - name: Smoke test
         run: |
-          taskboard init
-          taskboard check
-          taskboard status
+          taskboard --init
+          taskboard --check
+          taskboard --status
+          taskboard --audit-verify

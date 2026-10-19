@@ -1,4 +1,4 @@
-.PHONY: setup init check status run test lint
+.PHONY: setup init check status run audit graph test lint
 
 setup:
 	python -m pip install -e '.[dev]'
@@ -11,6 +11,12 @@ check:
 
 status:
 	python agent.py --status
+
+audit:
+	python agent.py --audit-verify
+
+graph:
+	python agent.py --graph --format json
 
 run:
 	python agent.py

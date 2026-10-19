@@ -1,7 +1,8 @@
 # Innovation Triage — Changes Worth Keeping
 
-**Status:** Decision record (analysis only; no runtime changes)
+**Status:** Implemented in 0.3.0
 **Baseline:** `51a2139` on `main`, 56 tests, single-process SQLite runtime
+**Result:** 67 tests passing, 80.5% coverage, `ruff` clean
 **Source proposal:** eight enhancements intended to push the project "above 90"
 **Authoritative contract:** [`AGENTS.md`](../../AGENTS.md), especially §1 (goal and
 non-goals), §8 (security), §11 (dry-run), and §13 (change control)
@@ -137,8 +138,8 @@ failure storm.
 - Enforce before claim (window/fan-out) and around execution (wall clock,
   output cap). Emit `BUDGET_EXCEEDED` and dead-letter with that code.
 - Trip `CIRCUIT_OPEN` when failures in a window exceed a configured threshold;
-  `--status` shows the open state. Recovery is deterministic (window expiry or
-  explicit `taskboard resume`), never a statistical baseline.
+  `--status` shows the open state. Recovery is deterministic (window expiry),
+  never a statistical baseline.
 
 **Acceptance.**
 - Injected clock makes window tests deterministic.
@@ -202,7 +203,7 @@ update all of them together:
 | Tables | `idempotency_ledger`, `audit_log`, lineage columns |
 | Events | `POLICY_DECISION`, `BUDGET_EXCEEDED`, `CIRCUIT_OPEN` |
 | Error codes | `IDEMPOTENCY_CONFLICT`, `POLICY_DENIED`, `BUDGET_EXCEEDED`, `CIRCUIT_OPEN`, `LINEAGE_INVALID` |
-| Commands | `audit --verify`, `graph`, `replay`, `resume` |
+| Commands | `audit --verify`, `graph`, `enqueue`, `replay` |
 | Config | `policy:` and `limits:` sections, deny-by-default defaults |
 | Files to update | `agent.py`, `docs/reference.md`, parity tests, `README.md`, `CHANGELOG.md`, and `AGENTS.md` §4/§6/§9/§13 |
 
