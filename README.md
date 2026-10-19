@@ -112,7 +112,7 @@ Relative paths resolve from the repository root. `AGENT_CONFIG` selects an alter
 | `taskboard --once [--dry-run]` | Execute or plan one task |
 | `taskboard --audit-verify` | Verify the hash-chained audit log |
 | `taskboard --graph [--format dot\|json]` | Export task lineage |
-| `taskboard --enqueue FILE` | Validate and enqueue a JSON payload |
+| `taskboard --enqueue FILE` | Validate and enqueue a JSON payload; repeating the same key and payload returns the existing task or stored result |
 | `taskboard --replay FILE` | Replay a fixture without side effects |
 | `taskboard` | Run the continuous worker |
 
@@ -136,7 +136,7 @@ ruff check .
 
 - SQLite is authoritative; `tasks.db` is generated and ignored by Git.
 - `AGENTS.md` is authoritative if documentation conflicts; `workspace/` output is disposable.
-- Queue replenishment is not implemented; enqueue work explicitly with `--enqueue`. Logs are JSONL on stdout; human progress goes to stderr.
+- Queue replenishment is not implemented; enqueue work explicitly with `--enqueue`. Enqueue is idempotent: the same key and payload return the existing task id, while a changed payload or action under the same key exits `1` with `IDEMPOTENCY_CONFLICT`. Logs are JSONL on stdout; human progress goes to stderr.
 - Missing PyYAML/jsonschema: run `python -m pip install -r requirements.txt`; the runtime fails closed.
 - Task stuck in `running`: restart the agent; recovery returns it to `pending` or dead-letters it.
 - Repeated failures: inspect `--status` for `circuit_open` and raise `limits.max_failures_per_window` only with a reason.

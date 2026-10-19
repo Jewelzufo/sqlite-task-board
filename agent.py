@@ -1001,7 +1001,49 @@ class Agent:
         return True
 
 
-    def enqueue_task(
+    def _existing_enqueue_record(self, existing, action_type, digest, key):
+        """Return an idempotent enqueue response or reject a payload mismatch."""
+        try:
+            previous_payload = json.loads(existing["instruction"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TaskError(
+                "IDEMPOTENCY_CONFLICT",
+                f"Idempotency key {key} has an unreadable stored payload",
+            ) from exc
+        if existing["action_type"] != action_type or payload_hash(previous_payload) != digest:
+            raise TaskError(
+                "IDEMPOTENCY_CONFLICT",
+                f"Idempotency key {key} is already used with a different action or payload",
+            )
+
+        ledger = self._ledger_entry(key)
+        if ledger is None:
+            return {
+                "task_id": int(existing["id"]),
+                "status": existing["status"],
+                "idempotent_replay": False,
+                "result": None,
+            }
+        if ledger["action_type"] != action_type or ledger["payload_hash"] != digest:
+            raise TaskError(
+                "IDEMPOTENCY_CONFLICT",
+                f"Idempotency key {key} conflicts with its stored result",
+            )
+        try:
+            stored_result = json.loads(ledger["result_json"])
+        except json.JSONDecodeError as exc:
+            raise TaskError(
+                "IDEMPOTENCY_CONFLICT",
+                f"Idempotency key {key} has an unreadable stored result",
+            ) from exc
+        return {
+            "task_id": int(existing["id"]),
+            "status": existing["status"],
+            "idempotent_replay": True,
+            "result": stored_result,
+        }
+
+    def enqueue_task_record(
         self,
         action_type,
         payload,
@@ -1009,7 +1051,13 @@ class Agent:
         max_attempts=3,
         parent_task_id=None,
     ):
-        """Validate and insert one task, enforcing lineage and policy."""
+        """Validate and enqueue one task, returning replay metadata.
+
+        Enqueueing an existing key with the same action and payload returns the
+        existing task instead of inserting a duplicate. If that task already has a
+        stored successful result, the response includes the result without executing
+        the action again.
+        """
         if priority not in PRIORITY_ORDER:
             raise TaskError("SCHEMA_VALIDATION_FAILED", f"Invalid priority: {priority}")
         if int(max_attempts) < 1:
@@ -1035,28 +1083,70 @@ class Agent:
                     "LINEAGE_INVALID",
                     f"Task depth {depth} exceeds limit {self.limits['max_spawn_depth']}",
                 )
+
+        key = payload["idempotency_key"]
+        digest = payload_hash(payload)
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            existing = self.conn.execute(
+                "SELECT id, action_type, instruction, status FROM tasks "
+                "WHERE idempotency_key=?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                record = self._existing_enqueue_record(existing, action_type, digest, key)
+                self.conn.commit()
+                return record
             cursor = self.conn.execute(
                 "INSERT INTO tasks (instruction, action_type, idempotency_key, "
                 "priority, max_attempts, parent_task_id, depth) VALUES (?,?,?,?,?,?,?)",
                 (
                     canonical_json(payload),
                     action_type,
-                    payload["idempotency_key"],
+                    key,
                     priority,
                     int(max_attempts),
                     parent_task_id,
                     depth,
                 ),
             )
+            task_id = int(cursor.lastrowid)
             self.conn.commit()
+        except TaskError:
+            self.conn.rollback()
+            raise
         except sqlite3.IntegrityError as exc:
             self.conn.rollback()
             raise TaskError(
                 "IDEMPOTENCY_CONFLICT",
-                f"Idempotency key {payload['idempotency_key']} is already queued",
+                f"Idempotency key {key} is already used with a different action or payload",
             ) from exc
-        return int(cursor.lastrowid)
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        return {
+            "task_id": task_id,
+            "status": "pending",
+            "idempotent_replay": False,
+            "result": None,
+        }
+
+    def enqueue_task(
+        self,
+        action_type,
+        payload,
+        priority="medium",
+        max_attempts=3,
+        parent_task_id=None,
+    ):
+        """Backward-compatible enqueue that returns only the task id."""
+        return self.enqueue_task_record(
+            action_type,
+            payload,
+            priority=priority,
+            max_attempts=max_attempts,
+            parent_task_id=parent_task_id,
+        )["task_id"]
 
     def graph(self, fmt="dot"):
         """Emit task lineage as DOT or JSON."""
@@ -1542,7 +1632,7 @@ def main():
             action_type = (
                 spec.get("action_type") if isinstance(spec, dict) else None
             ) or payload.get("action")
-            task_id = agent.enqueue_task(
+            record = agent.enqueue_task_record(
                 action_type,
                 payload,
                 priority=(spec.get("priority", args.priority)
@@ -1561,7 +1651,7 @@ def main():
             return 1
         finally:
             agent.conn.close()
-        print(json.dumps({"task_id": task_id}))
+        print(json.dumps(record, sort_keys=True))
         return 0
 
     if args.audit_verify or args.graph:

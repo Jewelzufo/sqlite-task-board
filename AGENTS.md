@@ -155,7 +155,7 @@ The runtime uses `BEGIN IMMEDIATE`, selects the oldest highest-priority eligible
 
 ### Idempotency
 
-A successful action writes its result to `idempotency_ledger` in the same transaction that marks the task completed. Replaying the same key and payload returns the stored result without re-executing. Reusing a key with a different action or payload fails with `IDEMPOTENCY_CONFLICT` and is dead-lettered immediately. Failed attempts are not recorded.
+A successful action writes its result to `idempotency_ledger` in the same transaction that marks the task completed. Enqueueing a key that already exists with the same action and canonical payload returns the existing task id instead of inserting a duplicate; if that task already has a stored success, the enqueue response includes `idempotent_replay: true` and the stored `result` without executing the action again. Reusing a key with a different action or payload fails with `IDEMPOTENCY_CONFLICT` and writes no task; a conflicting payload already attached to a queued task is dead-lettered immediately at execution. Failed attempts are not recorded, so retries still execute.
 
 ---
 
@@ -306,7 +306,8 @@ Acceptance criteria:
 - `--check` exits 0 and `--status` reports the queue;
 - claiming is atomic and the race test passes;
 - failures persist a documented `error_code` and emit `EXEC_ERROR`;
-- idempotent replay executes the action once and returns the stored result;
+- idempotent enqueue returns the existing task id, never duplicates a row, and returns the stored result after the first success;
+- idempotent execution replay executes the action once and returns the stored result;
 - policy decisions are emitted for allow and deny, including dry-run;
 - `--audit-verify` detects tampering at the correct sequence number;
 - budgets and the breaker are deterministic under an injected window;

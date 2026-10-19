@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Made enqueue idempotent end-to-end. Repeating the same key, action, and canonical
+  payload returns the existing task id instead of inserting a duplicate, and a completed
+  key returns its stored `result` with `idempotent_replay: true` without re-executing.
+  Reusing a key with a different action or payload still fails with
+  `IDEMPOTENCY_CONFLICT`.
+- Added regression coverage for same-payload enqueue, completed-result replay, payload/
+  action conflicts, and the `--enqueue` CLI output contract.
+
 ## 0.3.0
 
 - Enforced idempotency at execution time with an `idempotency_ledger`; successful

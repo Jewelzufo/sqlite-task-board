@@ -28,10 +28,21 @@ Priorities: `critical`, `high`, `medium`, `low`.
 
 Every validated payload must carry an `idempotency_key`. On success the runtime stores
 `(key, action_type, payload_hash, result_json)` in `idempotency_ledger` in the same
-transaction that marks the task completed. Re-running the same key with the same payload
-replays the stored result without invoking the action again. Reusing the key with a
-different action or payload fails closed with `IDEMPOTENCY_CONFLICT` and is dead-lettered
-immediately. Failed attempts do not populate the ledger, so retries still execute.
+transaction that marks the task completed.
+
+`enqueue_task()` and `--enqueue` are idempotent. Repeating the same key, action, and canonical
+payload returns the existing task id and inserts no second row. If that task already completed
+successfully, the response is:
+
+```json
+{"idempotent_replay": true, "result": {"status": "ok"}, "status": "completed", "task_id": 7}
+```
+
+A new or still-pending task returns `"idempotent_replay": false` and `"result": null`.
+Reusing the key with a different action or payload fails closed with `IDEMPOTENCY_CONFLICT`
+and writes no task; a conflicting payload already attached to a queued task is dead-lettered
+immediately at execution. Failed attempts do not populate the ledger, so retries still execute.
+A key stays bound to its first task: retrying a dead-lettered payload requires a new key.
 
 ## Audit chain
 
@@ -59,8 +70,8 @@ claiming: the first emits `BUDGET_EXCEEDED`, the second opens the circuit with
 ## Lineage
 
 `tasks.parent_task_id` and `tasks.depth` record task lineage. `enqueue_task()` rejects a
-missing parent, a depth above `limits.max_spawn_depth`, or a duplicate idempotency key
-with `LINEAGE_INVALID` / `IDEMPOTENCY_CONFLICT`. `--graph --format dot|json` exports the
+missing parent or depth overflow with `LINEAGE_INVALID`, and a reused key with a different
+action or payload with `IDEMPOTENCY_CONFLICT`. `--graph --format dot|json` exports the
 lineage; JSON output contains `nodes` and `edges`.
 
 ## Replay
@@ -184,6 +195,6 @@ At startup, `running` tasks with attempts remaining return to `pending` with `st
 | `--once` | `0` success, `1` task failure, `2` no pending work |
 | `--audit-verify` | `0` intact chain, `1` broken or missing chain |
 | `--graph` | `0` success, `1` database or format failure |
-| `--enqueue` | `0` inserted, `1` validation or database failure |
+| `--enqueue` | `0` inserted or replayed, `1` validation or database failure |
 | `--replay` | `0` expectation matched, `1` mismatch or unreadable fixture |
 | execution loop | `0` clean shutdown |
