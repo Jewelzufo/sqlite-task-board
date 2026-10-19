@@ -197,17 +197,21 @@ update all of them together:
 
 | Surface | Change |
 |---|---|
-| Schema | `agent.schema_version` 1 → 2; migrations `0002`/`0003` |
+| Schema | `agent.schema_version` 1 → 3 (migration `0002` in PR 1, `0003` in PR 5) |
+| Protocol | `agent.protocol_version` 3.1 → 3.2 |
 | Tables | `idempotency_ledger`, `audit_log`, lineage columns |
 | Events | `POLICY_DECISION`, `BUDGET_EXCEEDED`, `CIRCUIT_OPEN` |
 | Error codes | `IDEMPOTENCY_CONFLICT`, `POLICY_DENIED`, `BUDGET_EXCEEDED`, `CIRCUIT_OPEN`, `LINEAGE_INVALID` |
 | Commands | `audit --verify`, `graph`, `replay`, `resume` |
 | Config | `policy:` and `limits:` sections, deny-by-default defaults |
-| Files to update | `agent.py`, `docs/reference.md`, parity tests, `README.md`, `CHANGELOG.md`, `AGENTS.md` if operator behavior changes |
+| Files to update | `agent.py`, `docs/reference.md`, parity tests, `README.md`, `CHANGELOG.md`, and `AGENTS.md` §4/§6/§9/§13 |
 
-`--init` must remain idempotent across the version bump; recovery, dry-run
-purity, `shell=False`, path boundaries, and the exact host allowlist must not
-change.
+This is a breaking protocol bump, not an additive one: `AGENTS.md` §4 must
+declare `schema_version: 3` (2 after PR 1, 3 after PR 5) and
+`protocol_version: "3.2"`, and §6 must accept the configured version while
+continuing to refuse every other one. `--init` must remain idempotent across the
+version bump; recovery, dry-run purity, `shell=False`, path boundaries, and the
+exact host allowlist must not change.
 
 ---
 
@@ -236,7 +240,7 @@ local-first model.
 - [ ] Budgets and breaker behavior are deterministic under an injected clock.
 - [ ] Lineage rejects orphans, depth overflow, and cycles.
 - [ ] Every new event and error code appears in `docs/reference.md` and parity tests.
-- [ ] `python agent.py --init` twice yields three tasks and version 2.
+- [ ] `python agent.py --init` twice yields three tasks and schema version 3.
 - [ ] `python agent.py --check`, `--status`, `--once`, and `--once --dry-run` still pass.
 - [ ] `pytest`, `ruff check .`, and `scripts/ci.sh` pass.
 - [ ] No new network calls during bootstrap or tests.
