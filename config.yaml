@@ -3,11 +3,31 @@
 agent:
   workspace: "./workspace"
   database: "./tasks.db"
-  schema_version: 1
-  protocol_version: "3.1"
+  schema_version: 3
+  protocol_version: "3.2"
 
 # HTTP health checks are denied unless the host appears below.
 security:
   network_allowlist:
     - "127.0.0.1"
     - "localhost"
+
+# Deny-by-default execution policy. allowed_actions defaults to every
+# registered action; list a subset to narrow it.
+policy:
+  allowed_actions:
+    - "verify_runtime"
+    - "create_directories"
+    - "run_health_check"
+  allowed_path_roots:
+    - "."
+  max_payload_bytes: 65536
+
+# Deterministic resource governance. No model-based prediction.
+limits:
+  max_task_seconds: 60
+  max_output_bytes: 10240
+  max_tasks_per_window: 100
+  max_failures_per_window: 10
+  window_seconds: 60
+  max_spawn_depth: 3
