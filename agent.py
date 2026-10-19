@@ -36,6 +36,69 @@ CONFIG_PATH = ROOT / "config.yaml"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 DRY_RUN = os.getenv("AGENT_DRY_RUN", "").lower() in ("1", "true", "yes")
 
+
+class ConfigError(RuntimeError):
+    """Configuration or scaffold error carrying a stable error code."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _timestamp():
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def emit_event(event_type, **fields):
+    """Emit one JSONL lifecycle event to stdout."""
+    entry = {"timestamp": _timestamp(), "event": event_type}
+    entry.update(fields)
+    if DRY_RUN:
+        entry["dry_run"] = True
+    print(json.dumps(entry, default=str), flush=True)
+
+
+def resolve_path(value, default):
+    path = Path(value) if value else Path(default)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+def configured_db_path(config, override=None):
+    agent_config = config.get("agent") or {}
+    return resolve_path(override or agent_config.get("database"), DB_PATH)
+
+
+def load_config(path=None):
+    config_path = Path(path or os.getenv("AGENT_CONFIG") or CONFIG_PATH)
+    if not config_path.is_absolute():
+        config_path = ROOT / config_path
+    if yaml is None:
+        raise ConfigError(
+            "CONFIG_LOAD_FAILED",
+            "PyYAML is required; run: python -m pip install -r requirements.txt",
+        )
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError("CONFIG_LOAD_FAILED", f"Cannot read {config_path}: {exc}") from exc
+    try:
+        config = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigError("CONFIG_LOAD_FAILED", f"Invalid YAML in {config_path}: {exc}") from exc
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ConfigError("CONFIG_LOAD_FAILED", f"{config_path} must contain a mapping")
+    if not isinstance(config.get("agent"), dict):
+        raise ConfigError("CONFIG_LOAD_FAILED", f"{config_path} must define an 'agent' mapping")
+    try:
+        int(config["agent"].get("schema_version", 1))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("CONFIG_LOAD_FAILED", "agent.schema_version must be an integer") from exc
+    return config
+
 ACTION_SCHEMAS = {
     "verify_runtime": {
         "type": "object",
@@ -80,31 +143,65 @@ def register_action(name):
     return decorator
 
 class Agent:
-    def __init__(self, db_path=None, config=None):
-        self.db_path = Path(db_path) if db_path else DB_PATH
-        self.config = config or self._load_config()
-        self.workspace = Path(self.config.get("agent", {}).get("workspace", str(WORKSPACE)))
-        if not self.workspace.is_absolute():
-            self.workspace = ROOT / self.workspace
+    def __init__(self, db_path=None, config=None, auto_init=True):
+        self.config = config if config is not None else load_config()
+        agent_config = self.config.get("agent") or {}
+        self.db_path = configured_db_path(self.config, db_path)
+        self.workspace = resolve_path(agent_config.get("workspace"), WORKSPACE)
+        self.schema_version = int(agent_config.get("schema_version", 1))
+        self.protocol_version = str(agent_config.get("protocol_version", "3.1"))
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
-        self._init_db()
+        if auto_init:
+            self._init_db()
         self._register_actions()
-
-    def _load_config(self):
-        if CONFIG_PATH.exists():
-            if yaml is None:
-                raise RuntimeError("PyYAML required")
-            return yaml.safe_load(CONFIG_PATH.read_text()) or {}
-        return {}
 
     def _init_db(self):
         migration_file = ROOT / "migrations" / "0001_initial.sql"
-        if migration_file.exists():
-            self.conn.executescript(migration_file.read_text())
-        else:
-            self.conn.executescript("""CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, instruction TEXT NOT NULL, action_type TEXT NOT NULL, idempotency_key TEXT UNIQUE, status TEXT DEFAULT 'pending', priority TEXT DEFAULT 'medium', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, attempt_count INTEGER DEFAULT 0, max_attempts INTEGER DEFAULT 3, last_error TEXT); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);""")
+        if not migration_file.exists():
+            raise ConfigError("SCHEMA_FILE_MISSING", f"Migration not found: {migration_file}")
+        self.conn.executescript(migration_file.read_text(encoding="utf-8"))
         self.conn.commit()
+
+    def _workspace_path(self, relative):
+        base = self.workspace.resolve()
+        target = (base / relative).resolve()
+        if target != base and base not in target.parents:
+            raise ValueError(f"Path traversal rejected: {relative}")
+        return target
+
+    def database_ready(self):
+        try:
+            row = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+
+    def initialize(self):
+        """Apply the migration, seed the queue, and create workspace directories."""
+        self._init_db()
+        seed_file = ROOT / "seeds" / "bootstrap_tasks.sql"
+        if not seed_file.exists():
+            raise ConfigError("SEED_FILE_MISSING", f"Seed file not found: {seed_file}")
+        self.conn.executescript(seed_file.read_text(encoding="utf-8"))
+        self.conn.commit()
+        for name in ("logs", "data", "tmp"):
+            self._workspace_path(name).mkdir(parents=True, exist_ok=True)
+        total = self.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='pending'"
+        ).fetchone()[0]
+        result = {
+            "database": str(self.db_path),
+            "workspace": str(self.workspace),
+            "tasks": total,
+            "pending_tasks": pending,
+            "schema_version": self.schema_version,
+        }
+        self._log_event("INIT_COMPLETE", result)
+        return result
 
     def _register_actions(self):
         @register_action("verify_runtime")
@@ -130,11 +227,13 @@ class Agent:
             paths = payload.get("paths", [])
             created = []
             for rel_path in paths:
-                target = (self.workspace / rel_path).resolve()
-                if not str(target).startswith(str(self.workspace.resolve())):
-                    raise ValueError(f"Path traversal rejected: {rel_path}")
+                target = self._workspace_path(rel_path)
                 target.mkdir(parents=True, exist_ok=True)
-                created.append(str(target.relative_to(ROOT)))
+                try:
+                    label = str(target.relative_to(ROOT))
+                except ValueError:
+                    label = str(target)
+                created.append(label)
             return {"created": created}
 
         @register_action("run_health_check")
@@ -144,9 +243,14 @@ class Agent:
             parsed = urlparse(endpoint)
             if parsed.scheme not in ("http", "https"):
                 raise ValueError(f"Invalid protocol: {parsed.scheme}")
-            allowed_hosts = self.config.get("security", {}).get("network_allowlist", ["127.0.0.1", "localhost"])
+            allowed_hosts = self.config.get("security", {}).get("network_allowlist")
+            if not isinstance(allowed_hosts, list) or not allowed_hosts:
+                raise ConfigError(
+                    "CONFIG_LOAD_FAILED",
+                    "security.network_allowlist must be a non-empty list",
+                )
             host = parsed.hostname or ""
-            if host not in allowed_hosts and host not in ("127.0.0.1", "localhost"):
+            if host not in allowed_hosts:
                 raise ValueError(f"Host {host} not in allowlist")
             try:
                 req = Request(endpoint, method="GET")
@@ -159,47 +263,141 @@ class Agent:
                 raise RuntimeError(f"Health check failed: {e}")
 
     def _log_event(self, event_type, data=None):
-        log_entry = {"timestamp": datetime.utcnow().isoformat() + "Z", "event": event_type, "data": data or {}}
-        print(json.dumps(log_entry), flush=True)
+        entry = {"timestamp": _timestamp(), "event": event_type}
+        entry.update(data or {})
+        if DRY_RUN:
+            entry["dry_run"] = True
+        print(json.dumps(entry, default=str), flush=True)
 
     def _validate_payload(self, action_type, payload):
-        if not HAS_JSONSCHEMA or action_type not in ACTION_SCHEMAS:
-            return
+        if action_type not in ACTION_SCHEMAS:
+            raise ValueError(f"Unknown action type: {action_type}")
+        if not HAS_JSONSCHEMA:
+            raise RuntimeError(
+                "jsonschema is required for payload validation; "
+                "run: python -m pip install -r requirements.txt"
+            )
         schema = ACTION_SCHEMAS[action_type]
         try:
             validate(instance=payload, schema=schema)
         except SchemaValidationError as e:
             raise ValueError(f"Payload validation failed: {e.message}")
 
+    def _schema_version_matches(self):
+        try:
+            row = self.conn.execute(
+                "SELECT MAX(version) AS version FROM schema_migrations"
+            ).fetchone()
+        except sqlite3.Error:
+            self._log_event(
+                "SCHEMA_VERSION_MISMATCH",
+                {"expected": self.schema_version, "applied": None},
+            )
+            return False
+        applied = row["version"] if row else None
+        if applied is None or int(applied) != self.schema_version:
+            self._log_event(
+                "SCHEMA_VERSION_MISMATCH",
+                {"expected": self.schema_version, "applied": applied},
+            )
+            return False
+        return True
+
     def check(self):
         errors = []
-        try:
-            self.workspace.mkdir(exist_ok=True)
-            test_file = self.workspace / ".write_test"
-            test_file.write_text("ok")
-            test_file.unlink()
-        except Exception as e:
-            errors.append(f"workspace not writable: {e}")
-        try:
-            cur = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
-            if not cur.fetchone():
-                errors.append("tasks table missing")
-        except Exception as e:
-            errors.append(f"db error: {e}")
+        if yaml is None:
+            errors.append(
+                "PyYAML is not installed; run: python -m pip install -r requirements.txt"
+            )
+        if not HAS_JSONSCHEMA:
+            errors.append(
+                "jsonschema is not installed; run: python -m pip install -r requirements.txt"
+            )
+        if not self.workspace.exists():
+            errors.append(f"workspace missing: {self.workspace} (run --init)")
+        else:
+            try:
+                test_file = self.workspace / ".write_test"
+                test_file.write_text("ok", encoding="utf-8")
+                test_file.unlink()
+            except OSError as exc:
+                errors.append(f"workspace not writable: {exc}")
+
         pending = 0
-        try:
-            pending = self.conn.execute("SELECT COUNT(*) as c FROM tasks WHERE status='pending'").fetchone()["c"]
-        except:
-            pass
+        if not self.database_ready():
+            errors.append(f"database not initialized: {self.db_path} (run --init)")
+        elif not self._schema_version_matches():
+            errors.append(f"schema version mismatch: expected {self.schema_version}")
+        else:
+            pending = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks WHERE status='pending'"
+            ).fetchone()["c"]
+
         if errors:
             print("CHECK FAILED")
-            for e in errors:
-                print(f" - {e}")
+            for error in errors:
+                print(f" - {error}")
             return False
+
+        self._log_event("SCHEMA_CHECK_OK", {"schema_version": self.schema_version})
         print("CHECK PASSED")
         print(f" - workspace: {self.workspace}")
         print(f" - db: {self.db_path}")
+        print(f" - schema version: {self.schema_version}")
         print(f" - pending tasks: {pending}")
+        return True
+
+    def status(self, as_json=False):
+        if not self.database_ready():
+            message = (
+                f"Database not initialized: {self.db_path}. "
+                "Run: python agent.py --init"
+            )
+            if as_json:
+                print(json.dumps({"error": message}))
+            else:
+                print(message)
+            return False
+
+        counts = {
+            row["status"]: row["count"]
+            for row in self.conn.execute(
+                "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
+            )
+        }
+        priorities = {
+            row["priority"]: row["count"]
+            for row in self.conn.execute(
+                "SELECT priority, COUNT(*) AS count FROM tasks "
+                "WHERE status='pending' GROUP BY priority"
+            )
+        }
+        next_task = self.fetch_next_task()
+        payload = {
+            "database": str(self.db_path),
+            "schema_version": self.schema_version,
+            "status_counts": counts,
+            "pending_by_priority": priorities,
+            "next_task_id": next_task["id"] if next_task else None,
+        }
+        if as_json:
+            print(json.dumps(payload))
+            return True
+
+        print(f"Database: {self.db_path}")
+        print(f"Schema version: {self.schema_version}")
+        print(
+            "Status counts: "
+            + (", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "none")
+        )
+        print(
+            "Pending by priority: "
+            + (
+                ", ".join(f"{key}={value}" for key, value in sorted(priorities.items()))
+                or "none"
+            )
+        )
+        print(f"Next task: {payload['next_task_id'] if payload['next_task_id'] is not None else 'none'}")
         return True
 
     def fetch_next_task(self):
@@ -207,15 +405,27 @@ class Agent:
         return self.conn.execute(sql).fetchone()
 
     def recover_interrupted_tasks(self):
-        cur = self.conn.execute("SELECT id, attempt_count, max_attempts FROM tasks WHERE status='running'")
+        cur = self.conn.execute(
+            "SELECT id, attempt_count, max_attempts FROM tasks WHERE status='running'"
+        )
         for task in cur.fetchall():
             task_id = task["id"]
             attempts = task["attempt_count"]
             max_attempts = task["max_attempts"]
             if attempts >= max_attempts:
-                self.conn.execute("UPDATE tasks SET status='dead-lettered', failed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?", (task_id,))
+                self.conn.execute(
+                    "UPDATE tasks SET status='dead-lettered', "
+                    "error_code='INTERRUPTED_MAX_ATTEMPTS_EXCEEDED', "
+                    "failed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=?",
+                    (task_id,),
+                )
             else:
-                self.conn.execute("UPDATE tasks SET status='pending', updated_at=CURRENT_TIMESTAMP WHERE id=?", (task_id,))
+                self.conn.execute(
+                    "UPDATE tasks SET status='pending', started_at=NULL, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (task_id,),
+                )
         self.conn.commit()
 
     def update_task(self, task_id, **fields):
@@ -269,28 +479,109 @@ class Agent:
             return False
 
     def run_loop(self):
-        self._log_event("STARTUP", {"workspace": str(self.workspace), "db": str(self.db_path)})
+        self._log_event(
+            "STARTUP",
+            {
+                "workspace": str(self.workspace),
+                "db": str(self.db_path),
+                "protocol_version": self.protocol_version,
+            },
+        )
         print(f"Agent started. DRY_RUN={DRY_RUN}. Ctrl-C to stop.")
-        while True:
-            ran = self.run_once()
-            if not ran:
-                time.sleep(2)
+        try:
+            while True:
+                ran = self.run_once()
+                if not ran:
+                    time.sleep(2)
+        except KeyboardInterrupt:
+            print("\nShutdown requested.")
+            self._log_event("SHUTDOWN_REQUESTED", {})
+            self._log_event("SHUTDOWN_COMPLETE", {})
+
 
 def main():
     parser = argparse.ArgumentParser(description="SQLite Task Board Agent")
-    parser.add_argument("--check", action="store_true", help="Validate configuration")
-    parser.add_argument("--once", action="store_true", help="Run one task")
-    parser.add_argument("--db", default=str(DB_PATH), help="Path to tasks.db")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--check", action="store_true", help="Validate configuration and database")
+    actions.add_argument("--init", action="store_true", help="Apply migrations, seed tasks, create workspace dirs")
+    actions.add_argument("--status", action="store_true", help="Show queue status")
+    actions.add_argument("--once", action="store_true", help="Run one task")
+    parser.add_argument("--json", action="store_true", help="Emit JSON for --status")
+    parser.add_argument("--db", default=None, help="Path to tasks.db (overrides config)")
     args = parser.parse_args()
-    agent = Agent(args.db)
-    agent.recover_interrupted_tasks()
+
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        emit_event("CONFIG_LOAD_FAILED", error_code=exc.code, error=str(exc))
+        return 1
+
+    if args.init:
+        try:
+            agent = Agent(args.db, config=config, auto_init=False)
+            agent.initialize()
+        except (ConfigError, OSError, sqlite3.Error) as exc:
+            emit_event(
+                "EXEC_ERROR",
+                error_code=getattr(exc, "code", "INIT_FAILED"),
+                error=str(exc),
+            )
+            return 1
+        return 0
+
+    db_path = configured_db_path(config, args.db)
+    if args.check and not db_path.exists():
+        print("CHECK FAILED")
+        print(f" - database not initialized: {db_path} (run --init)")
+        return 1
+
     if args.check:
-        ok = agent.check()
-        sys.exit(0 if ok else 1)
-    elif args.once:
+        agent = Agent(args.db, config=config, auto_init=False)
+        return 0 if agent.check() else 1
+
+    if args.status:
+        if not db_path.exists():
+            message = f"Database not initialized: {db_path}. Run: python agent.py --init"
+            if args.json:
+                print(json.dumps({"error": message}))
+            else:
+                print(message)
+            return 1
+        agent = Agent(args.db, config=config, auto_init=False)
+        return 0 if agent.status(as_json=args.json) else 1
+
+    missing = []
+    if yaml is None:
+        missing.append("pyyaml")
+    if not HAS_JSONSCHEMA:
+        missing.append("jsonschema")
+    if missing:
+        emit_event(
+            "CONFIG_LOAD_FAILED",
+            error_code="DEPENDENCY_MISSING",
+            error="Missing dependencies: " + ", ".join(missing)
+            + "; run: python -m pip install -r requirements.txt",
+        )
+        return 1
+
+    agent = Agent(args.db, config=config, auto_init=False)
+    if not agent.database_ready():
+        emit_event(
+            "EXEC_ERROR",
+            error_code="DATABASE_NOT_INITIALIZED",
+            error="Database not initialized. Run: python agent.py --init",
+        )
+        return 1
+    if not agent._schema_version_matches():
+        return 1
+
+    agent.recover_interrupted_tasks()
+    if args.once:
         agent.run_once()
-    else:
-        agent.run_loop()
+        return 0
+    agent.run_loop()
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -55,7 +55,6 @@ sqlite-task-board/
 ├── README.md
 ├── opencode.json
 ├── agent.py
-├── config.example.yaml
 ├── config.yaml
 ├── requirements.txt
 ├── .gitignore
@@ -124,9 +123,9 @@ workspace/
 
 Add `workspace/.gitkeep` so the workspace directory exists in version control while remaining empty.
 
-### Step 4: Create config files
+### Step 4: Create the config file
 
-Create `config.example.yaml` and `config.yaml` from the configuration template in Section 4. `config.yaml` must use repository-relative defaults and must not contain secrets.
+Create `config.yaml` from the configuration template in Section 4. It must use repository-relative defaults and must not contain secrets. There is no separate example file.
 
 ### Step 5: Create migration and seed files
 
@@ -147,14 +146,20 @@ Create:
 
 ### Step 7: Initialize the database
 
-Run these local commands from `REPO_ROOT` if SQLite is available:
+Run the idempotent initializer from `REPO_ROOT`:
+
+```bash
+python agent.py --init
+```
+
+It applies `migrations/0001_initial.sql`, seeds `seeds/bootstrap_tasks.sql`, and creates the workspace directories. Re-running it must not duplicate tasks.
+
+If Python cannot run yet, initialize with the SQLite CLI:
 
 ```bash
 sqlite3 tasks.db < migrations/0001_initial.sql
 sqlite3 tasks.db < seeds/bootstrap_tasks.sql
 ```
-
-If the `sqlite3` CLI is unavailable, initialize the database with Python's built-in `sqlite3` module using the same SQL files.
 
 ### Step 8: Validate scaffold
 
@@ -163,6 +168,7 @@ Run:
 ```bash
 python -m py_compile agent.py
 python agent.py --check
+python agent.py --status
 ```
 
 If `pytest` is available, also run:
@@ -185,9 +191,9 @@ Then continue with normal task board operation. Do not bypass the task queue for
 
 ---
 
-## 4. Configuration Files
+## 4. Configuration File
 
-### `config.example.yaml`
+Create `config.yaml` with this content. These defaults are safe for local operation and require no secrets.
 
 ```yaml
 agent:
@@ -196,35 +202,13 @@ agent:
   schema_version: 1
   protocol_version: "3.1"
 
-task_board:
-  max_attempts_default: 3
-  replenishment_batch_size: 10
-  max_generated_per_day: 50
-  claim_limit: 1
-
 security:
-  workspace_boundary: "./workspace"
-  readonly_paths:
-    - "."
   network_allowlist:
     - "127.0.0.1"
     - "localhost"
-  package_managers:
-    - "pip"
-    - "uv"
-    - "npm"
-  internal_registries: []
-  allow_public_registries: false
-
-logging:
-  level: "INFO"
-  format: "jsonl"
-  output: "stdout"
 ```
 
-### `config.yaml`
-
-Create `config.yaml` with the same values as `config.example.yaml`. These defaults are safe for local operation and require no secrets.
+Repository-relative paths resolve from the repository root. These are the only keys the runtime reads. Do not add a second example config.
 
 ---
 
@@ -300,7 +284,7 @@ VALUES
     3
   ),
   (
-    '{"action":"create_directories","paths":["./workspace/logs","./workspace/data","./workspace/tmp"],"idempotency_key":"bootstrap-create-workspace-dirs"}',
+    '{"action":"create_directories","paths":["logs","data","tmp"],"idempotency_key":"bootstrap-create-workspace-dirs"}',
     'create_directories',
     'bootstrap-create-workspace-dirs',
     'pending',
@@ -336,7 +320,7 @@ Create `agent.py` as a self-contained Python runtime. It must implement the foll
 - Enforce network allowlist checks.
 - Execute only registered actions.
 - Emit JSONL logs to stdout.
-- Support `--check`, `--once`, and continuous default mode.
+- Support `--init`, `--check`, `--status`, `--once`, and continuous default mode.
 - Support dry-run via `AGENT_DRY_RUN=true`.
 
 Minimum registered actions:
@@ -344,8 +328,6 @@ Minimum registered actions:
 ```text
 verify_runtime
 create_directories
-setup_env_file
-install_dependencies
 run_health_check
 ```
 
@@ -357,7 +339,7 @@ Implementation requirements:
 - Use urllib from the Python standard library for health checks.
 - Prefer PyYAML for config parsing. If PyYAML is unavailable, fail with CONFIG_LOAD_FAILED and explain that pyyaml must be installed.
 - Do not require network access during bootstrap.
-- Do not write outside security.workspace_boundary except for project scaffold files created during Phase 0 bootstrap.
+- Do not write outside `agent.workspace` except for project scaffold files created during Phase 0 bootstrap.
 ```
 
 ---
@@ -385,8 +367,7 @@ Required tests:
 ```text
 - AGENTS.md exists.
 - opencode.json exists and references AGENTS.md.
-- config.example.yaml exists.
-- config.yaml exists.
+- config.yaml exists with the canonical keys.
 - migrations/0001_initial.sql exists and creates tasks and schema_migrations.
 - seeds/bootstrap_tasks.sql exists and inserts bootstrap tasks.
 - agent.py exists and contains ACTION_REGISTRY.
@@ -408,21 +389,18 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+*.egg-info/
 
-# Local runtime
+# Runtime state
 *.db
 *.db-shm
 *.db-wal
-*.sqlite
-*.sqlite3
 logs/
 workspace/*
 !workspace/.gitkeep
 
-# Local config and secrets
-.env
-.env.*
-!.env.example
+# Agent/tooling state
+.cline-home/
 
 # OS/editor
 .DS_Store
@@ -537,42 +515,6 @@ Every payload must match its action schema exactly. All schemas must set `additi
 }
 ```
 
-### `setup_env_file`
-
-```json
-{
-  "type": "object",
-  "required": ["action", "source_template", "target_file", "idempotency_key"],
-  "additionalProperties": false,
-  "properties": {
-    "action": { "type": "string", "const": "setup_env_file" },
-    "source_template": { "type": "string", "maxLength": 256 },
-    "target_file": { "type": "string", "maxLength": 256 },
-    "require_overwrite": { "type": "boolean", "default": false },
-    "idempotency_key": { "type": "string", "maxLength": 128, "pattern": "^[a-z0-9\\-_]+$" }
-  }
-}
-```
-
-### `install_dependencies`
-
-```json
-{
-  "type": "object",
-  "required": ["action", "manager", "requirements_file", "registry", "require_hashes", "timeout_seconds", "idempotency_key"],
-  "additionalProperties": false,
-  "properties": {
-    "action": { "type": "string", "const": "install_dependencies" },
-    "manager": { "type": "string", "enum": ["pip", "npm", "uv"], "maxLength": 32 },
-    "requirements_file": { "type": "string", "maxLength": 256 },
-    "registry": { "type": "string", "maxLength": 512, "format": "uri" },
-    "require_hashes": { "type": "boolean" },
-    "timeout_seconds": { "type": "integer", "minimum": 30, "maximum": 600 },
-    "idempotency_key": { "type": "string", "maxLength": 128, "pattern": "^[a-z0-9\\-_]+$" }
-  }
-}
-```
-
 ### `run_health_check`
 
 ```json
@@ -598,7 +540,7 @@ All ordinary task execution uses zero-trust defaults.
 ### 14.1 Filesystem
 
 - During Phase 0 bootstrap, scaffold writes may occur under `REPO_ROOT` only.
-- After bootstrap, task writes must stay inside `security.workspace_boundary`.
+- After bootstrap, task writes must stay inside `agent.workspace`.
 - Path traversal such as `../` must be rejected.
 - Absolute paths outside the workspace must be rejected.
 
@@ -606,9 +548,8 @@ All ordinary task execution uses zero-trust defaults.
 
 - Never use `shell=True`.
 - Pass command arguments as lists.
-- Use a minimal environment.
 - Set timeouts for all subprocess calls.
-- Capture and truncate stdout and stderr to 10 KB.
+- Capture stdout and stderr where practical.
 
 ### 14.3 Network
 
@@ -619,8 +560,7 @@ All ordinary task execution uses zero-trust defaults.
 ### 14.4 Secrets
 
 - Never log secrets.
-- Never create `.env` files containing real secrets.
-- Redact keys containing `password`, `secret`, `token`, `credential`, `api_key`, or `key` before logging.
+- Do not write secrets into generated files.
 
 ---
 
@@ -635,32 +575,29 @@ event
 
 Task-scoped events must also include `task_id`.
 
-Required events:
+Required events in this version:
 
 ```text
-BOOTSTRAP_START
-BOOTSTRAP_FILE_WRITTEN
-BOOTSTRAP_DATABASE_INITIALIZED
+CONFIG_LOAD_FAILED
+INIT_COMPLETE
 STARTUP
 SCHEMA_CHECK_OK
-RECOVERY_COMPLETE
+SCHEMA_VERSION_MISMATCH
 EXEC_START
 EXEC_END
 EXEC_ERROR
-SECURITY_ALERT
-QUEUE_REPLENISH
+TASK_DEAD_LETTERED
 SHUTDOWN_REQUESTED
-TASK_RELEASED
 SHUTDOWN_COMPLETE
 ```
 
 Example:
 
 ```jsonl
-{"timestamp":"2026-01-01T10:00:00Z","event":"BOOTSTRAP_START","protocol_version":"3.1"}
-{"timestamp":"2026-01-01T10:00:01Z","event":"BOOTSTRAP_FILE_WRITTEN","path":"opencode.json"}
-{"timestamp":"2026-01-01T10:00:02Z","event":"BOOTSTRAP_DATABASE_INITIALIZED","database":"./tasks.db"}
-{"timestamp":"2026-01-01T10:00:03Z","event":"EXEC_START","task_id":1,"action":"verify_runtime","attempt":1}
+{"timestamp":"2026-01-01T10:00:00Z","event":"CONFIG_LOAD_FAILED","error_code":"CONFIG_LOAD_FAILED","error":"PyYAML is required"}
+{"timestamp":"2026-01-01T10:00:01Z","event":"INIT_COMPLETE","database":"./tasks.db","pending_tasks":3}
+{"timestamp":"2026-01-01T10:00:02Z","event":"STARTUP","protocol_version":"3.1"}
+{"timestamp":"2026-01-01T10:00:03Z","event":"EXEC_START","task_id":1,"action_type":"verify_runtime"}
 ```
 
 ---
@@ -678,7 +615,7 @@ PATH_OUTSIDE_WORKSPACE             write target outside workspace boundary
 PATH_TRAVERSAL_ATTEMPT             detected path traversal
 UNAPPROVED_HOST                    network host not in allowlist
 UNAPPROVED_PROTOCOL                protocol other than http or https
-DEPENDENCY_INSTALL_BLOCKED         dependency install constraint violated
+DEPENDENCY_MISSING                 required Python dependency is not installed
 PROCESS_TIMEOUT                    subprocess exceeded timeout
 PROCESS_EXIT_NONZERO               subprocess returned non-zero exit code
 INTERRUPTED_MAX_ATTEMPTS_EXCEEDED  crash-recovered task with no retries left
@@ -729,25 +666,13 @@ There is no mandatory inter-retry delay in v3.1.
 
 ## 18. Queue Replenishment
 
-When no pending tasks remain, generate up to `task_board.replenishment_batch_size` new tasks without exceeding `task_board.max_generated_per_day`.
-
-Replenishment tasks should be safe and local by default:
-
-```text
-verify_runtime
-create_directories
-run_health_check against allowlisted local endpoints only
-```
-
-Do not generate dependency installation tasks unless required lockfiles and approved registries are present.
+Reserved. Queue replenishment is not implemented in this version. Do not generate new tasks automatically; enqueue work explicitly through SQLite.
 
 ---
 
 ## 19. Dry-Run Mode
 
-If `AGENT_DRY_RUN=true`, execute the lifecycle inside a database transaction and roll back before exit. Append `"dry_run": true` to every log event.
-
-Dry-run must still perform validation, security checks, and command planning. It must not persist task status changes.
+If `AGENT_DRY_RUN=true`, validation, security checks, and command planning still run, but task status changes are not persisted. The current implementation does not open a rollback transaction; it skips `update_task` writes and appends `"dry_run": true` to every emitted event.
 
 ---
 
@@ -756,9 +681,11 @@ Dry-run must still perform validation, security checks, and command planning. It
 The bootstrap is complete only when all of the following are true:
 
 - `opencode.json` exists and references `AGENTS.md`.
-- `config.example.yaml` exists.
 - `config.yaml` exists with safe local defaults.
 - `migrations/0001_initial.sql` exists.
 - `seeds/bootstrap_tasks.sql` exists.
 - `agent.py` exists.
+- `python agent.py --init` creates three pending tasks and is idempotent.
+- `python agent.py --check` exits 0 and `python agent.py --status` reports the queue.
+
 - `requirements.txt` exists.

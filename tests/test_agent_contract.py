@@ -1,21 +1,22 @@
 """
 test_agent_contract.py
 
-Contract tests for SQLite Task Board agent.py
+Contract and behavior tests for the SQLite Task Board agent.
 
 Validates:
 - AGENTS.md exists
 - opencode.json exists and references AGENTS.md
-- config.example.yaml exists
-- config.yaml exists
+- config.yaml exists and uses the canonical schema
 - migrations/0001_initial.sql exists and creates tasks and schema_migrations
 - seeds/bootstrap_tasks.sql exists and inserts bootstrap tasks
 - agent.py exists and contains ACTION_REGISTRY
 - requirements.txt exists
+- init/seed idempotency, schema mismatch, config failure, and CLI init
 """
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -37,11 +38,6 @@ def test_opencode_json_exists_and_references_agents():
     content = json.loads(opencode_file.read_text())
     assert "instructions" in content, "opencode.json must have instructions field"
     assert "AGENTS.md" in content["instructions"], "opencode.json must reference AGENTS.md"
-
-def test_config_example_yaml_exists():
-    """config.example.yaml must exist."""
-    config_file = ROOT / "config.example.yaml"
-    assert config_file.exists(), "config.example.yaml must exist"
 
 def test_config_yaml_exists():
     """config.yaml must exist."""
@@ -80,19 +76,37 @@ def test_requirements_txt_exists():
 
 
 def setup_agent(tmpdir):
-    """Set up agent with temporary database and workspace."""
+    """Set up an isolated agent with a temporary database and workspace."""
     from agent import Agent
-    
+
+    workspace = Path(tmpdir) / "workspace"
+    workspace.mkdir(exist_ok=True)
     db_path = Path(tmpdir) / "test_tasks.db"
-    agent = Agent(db_path)
-    
-    # Override workspace to temp location for isolation
-    import agent as agent_module
-    agent_module.WORKSPACE = Path(tmpdir) / "workspace"
-    agent.workspace = agent_module.WORKSPACE
-    agent.workspace.mkdir(exist_ok=True)
-    
-    return agent
+    config = {
+        "agent": {
+            "workspace": str(workspace),
+            "database": str(db_path),
+            "schema_version": 1,
+            "protocol_version": "3.1",
+        },
+        "security": {"network_allowlist": ["127.0.0.1", "localhost"]},
+    }
+    return Agent(db_path, config=config)
+
+
+def test_config_yaml_uses_canonical_schema():
+    """Every key in config.yaml must be one the runtime reads."""
+    import yaml
+
+    config = yaml.safe_load((ROOT / "config.yaml").read_text())
+    assert set(config) == {"agent", "security"}
+    assert set(config["agent"]) == {
+        "workspace",
+        "database",
+        "schema_version",
+        "protocol_version",
+    }
+    assert config["security"]["network_allowlist"]
 
 
 def test_schema_creates_tasks_table():
@@ -178,13 +192,172 @@ def test_check_passes():
         assert agent.check() is True
 
 
+def test_action_registry_matches_documented_surface():
+    """Only the three documented actions should be registered."""
+    import agent as agent_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        agent = setup_agent(tmp)
+        assert set(agent_module.ACTION_REGISTRY) == {
+            "verify_runtime",
+            "create_directories",
+            "run_health_check",
+        }
+        agent.conn.close()
+
+
+def test_init_seeds_once_and_creates_workspace():
+    """Repeated init must not duplicate seed tasks and must create dirs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        agent = setup_agent(tmp)
+        first = agent.initialize()
+        second = agent.initialize()
+
+        assert first["tasks"] == 3
+        assert second["tasks"] == 3
+        pending = agent.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='pending'"
+        ).fetchone()[0]
+        assert pending == 3
+        for name in ("logs", "data", "tmp"):
+            assert (agent.workspace / name).is_dir()
+        agent.conn.close()
+
+
+def test_schema_version_mismatch():
+    """A configured schema version that differs from the DB must fail check."""
+    from agent import Agent
+
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "workspace"
+        workspace.mkdir()
+        db_path = Path(tmp) / "mismatch.db"
+        config = {
+            "agent": {
+                "workspace": str(workspace),
+                "database": str(db_path),
+                "schema_version": 99,
+            },
+            "security": {"network_allowlist": ["127.0.0.1"]},
+        }
+        agent = Agent(db_path, config=config)
+        assert agent.check() is False
+        agent.conn.close()
+
+
+def test_config_load_failure_is_structured():
+    """Missing PyYAML must raise ConfigError, not a bare RuntimeError."""
+    import agent as agent_module
+
+    original = agent_module.yaml
+    agent_module.yaml = None
+    try:
+        try:
+            agent_module.load_config()
+        except agent_module.ConfigError as exc:
+            assert exc.code == "CONFIG_LOAD_FAILED"
+            assert "PyYAML" in str(exc)
+        else:
+            raise AssertionError("load_config should fail without PyYAML")
+    finally:
+        agent_module.yaml = original
+
+
+def test_agent_config_env_override():
+    """AGENT_CONFIG must select an alternate configuration file."""
+    import agent as agent_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = Path(tmp) / "custom.yaml"
+        config_path.write_text(
+            "agent:\n  workspace: ./workspace\n  database: ./custom.db\n",
+            encoding="utf-8",
+        )
+        original = os.environ.get("AGENT_CONFIG")
+        os.environ["AGENT_CONFIG"] = str(config_path)
+        try:
+            config = agent_module.load_config()
+        finally:
+            if original is None:
+                os.environ.pop("AGENT_CONFIG", None)
+            else:
+                os.environ["AGENT_CONFIG"] = original
+        assert config["agent"]["database"] == "./custom.db"
+
+
+def test_init_cli_seeds_database():
+    """The --init command must create the DB and seed exactly three tasks."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "workspace"
+        db_path = Path(tmp) / "cli.db"
+        config_path = Path(tmp) / "config.yaml"
+        config_path.write_text(
+            "agent:\n"
+            f'  workspace: "{workspace}"\n'
+            f'  database: "{db_path}"\n'
+            "  schema_version: 1\n"
+            '  protocol_version: "3.1"\n'
+            "security:\n"
+            '  network_allowlist: ["127.0.0.1", "localhost"]\n',
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["AGENT_CONFIG"] = str(config_path)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "agent.py"), "--init"],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        conn = sqlite3.connect(db_path)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 3
+
+
+
+def test_check_cli_reports_uninitialized_without_creating_db():
+    """--check must fail clearly and must not create an empty database."""
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "workspace"
+        workspace.mkdir()
+        db_path = Path(tmp) / "missing.db"
+        config_path = Path(tmp) / "config.yaml"
+        config_path.write_text(
+            "agent:\n"
+            f'  workspace: "{workspace}"\n'
+            f'  database: "{db_path}"\n'
+            "  schema_version: 1\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["AGENT_CONFIG"] = str(config_path)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "agent.py"), "--check"],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        assert "run --init" in result.stdout
+        assert not db_path.exists(), "check must not create a database"
+
+
+
 if __name__ == "__main__":
     # Simple runner without pytest
     tests = [
         test_agents_md_exists,
         test_opencode_json_exists_and_references_agents,
-        test_config_example_yaml_exists,
         test_config_yaml_exists,
+        test_config_yaml_uses_canonical_schema,
         test_migrations_initial_sql_exists,
         test_bootstrap_tasks_sql_exists,
         test_agent_py_exists_and_contains_action_registry,
@@ -195,6 +368,13 @@ if __name__ == "__main__":
         test_file_write_security,
         test_retry_then_dead_letter,
         test_check_passes,
+        test_action_registry_matches_documented_surface,
+        test_init_seeds_once_and_creates_workspace,
+        test_schema_version_mismatch,
+        test_config_load_failure_is_structured,
+        test_agent_config_env_override,
+        test_init_cli_seeds_database,
+        test_check_cli_reports_uninitialized_without_creating_db,
     ]
     failed = False
     for test in tests:

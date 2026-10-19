@@ -11,7 +11,7 @@ VALUES
     3
   ),
   (
-    '{"action":"create_directories","paths":["./workspace/logs","./workspace/data","./workspace/tmp"],"idempotency_key":"bootstrap-create-workspace-dirs"}',
+    '{"action":"create_directories","paths":["logs","data","tmp"],"idempotency_key":"bootstrap-create-workspace-dirs"}',
     'create_directories',
     'bootstrap-create-workspace-dirs',
     'pending',
