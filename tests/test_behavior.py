@@ -340,7 +340,8 @@ def test_docs_match_runtime_surfaces():
 
 def test_packaging_and_ci_exist():
     assert (ROOT / "pyproject.toml").exists()
-    assert (ROOT / ".github" / "workflows" / "ci.yml").exists()
+    assert (ROOT / "docs" / "ci-workflow.yml").exists()
+    assert (ROOT / "scripts" / "ci.sh").exists()
     assert (ROOT / "Makefile").exists()
     assert (ROOT / "docs" / "reference.md").exists()
     assert not (ROOT / "assets").exists()

@@ -50,6 +50,8 @@ sqlite-task-board/
 ├── migrations/0001_initial.sql
 ├── seeds/bootstrap_tasks.sql
 ├── docs/reference.md
+├── docs/ci-workflow.yml
+├── scripts/ci.sh
 ├── tests/
 │   ├── test_agent_contract.py
 │   └── test_behavior.py
@@ -257,7 +259,7 @@ Acceptance criteria:
 - failures persist a documented `error_code` and emit `EXEC_ERROR`;
 - dry-run has no side effects;
 - health checks reject unapproved hosts, protocols, and redirects;
-- tests and lint pass in CI on Python 3.11 and 3.12;
+- tests and lint pass via `scripts/ci.sh` and the `docs/ci-workflow.yml` template;
 - no database, cache, or unreferenced binary asset is tracked.
 
 ---
