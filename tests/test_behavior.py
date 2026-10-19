@@ -575,6 +575,122 @@ def test_idempotency_conflict_is_dead_lettered(agent):
     assert row["error_code"] == "IDEMPOTENCY_CONFLICT"
 
 
+def test_enqueue_same_payload_is_idempotent(agent):
+    payload = {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+               "idempotency_key": "enqueue-idempotent"}
+    first = agent.enqueue_task_record("verify_runtime", payload)
+    second = agent.enqueue_task_record("verify_runtime", payload)
+    assert first["task_id"] == second["task_id"]
+    assert first["idempotent_replay"] is False
+    assert second["idempotent_replay"] is False
+    assert second["status"] == "pending"
+    assert second["result"] is None
+    rows = agent.conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE idempotency_key='enqueue-idempotent'"
+    ).fetchone()[0]
+    assert rows == 1
+    assert agent.enqueue_task("verify_runtime", payload) == first["task_id"]
+
+
+def test_enqueue_replays_completed_result_without_new_task(agent):
+    agent.conn.execute("DELETE FROM tasks")
+    agent.conn.commit()
+    payload = {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+               "idempotency_key": "enqueue-replay-result"}
+    first = agent.enqueue_task_record("verify_runtime", payload)
+    assert agent.run_once() is True
+
+    replay = agent.enqueue_task_record("verify_runtime", payload)
+    assert replay["task_id"] == first["task_id"]
+    assert replay["status"] == "completed"
+    assert replay["idempotent_replay"] is True
+    assert replay["result"]["status"] == "ok"
+    assert agent.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    assert agent.conn.execute(
+        "SELECT COUNT(*) FROM idempotency_ledger WHERE key='enqueue-replay-result'"
+    ).fetchone()[0] == 1
+    assert agent.run_once() is None
+
+
+def test_enqueue_rejects_same_key_with_changed_payload_or_action(agent):
+    agent.conn.execute("DELETE FROM tasks")
+    agent.conn.commit()
+    payload = {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+               "idempotency_key": "enqueue-conflict"}
+    agent.enqueue_task_record("verify_runtime", payload)
+
+    changed_payload = dict(payload, min_version="3.12")
+    with pytest.raises(TaskError) as payload_error:
+        agent.enqueue_task_record("verify_runtime", changed_payload)
+    assert payload_error.value.code == "IDEMPOTENCY_CONFLICT"
+
+    changed_action = {"action": "create_directories", "paths": ["elsewhere"],
+                      "idempotency_key": "enqueue-conflict"}
+    with pytest.raises(TaskError) as action_error:
+        agent.enqueue_task_record("create_directories", changed_action)
+    assert action_error.value.code == "IDEMPOTENCY_CONFLICT"
+    assert agent.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_cli_enqueue_is_idempotent(tmp_path):
+    assert _run_cli(tmp_path, "--init").returncode == 0
+    task_file = tmp_path / "idempotent.json"
+    task_file.write_text(json.dumps({
+        "action": "verify_runtime", "language": "python", "min_version": "3.11",
+        "idempotency_key": "cli-idempotent",
+    }), encoding="utf-8")
+    first = _run_cli(tmp_path, "--enqueue", str(task_file))
+    second = _run_cli(tmp_path, "--enqueue", str(task_file))
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    first_record = json.loads(first.stdout.strip())
+    second_record = json.loads(second.stdout.strip())
+    assert first_record["task_id"] == second_record["task_id"]
+    assert second_record["idempotent_replay"] is False
+    status = _run_cli(tmp_path, "--status", "--json")
+    counts = json.loads(status.stdout.strip())["status_counts"]
+    assert counts["pending"] == 4
+
+    changed_file = tmp_path / "changed.json"
+    changed_file.write_text(json.dumps({
+        "action": "verify_runtime", "language": "python", "min_version": "3.12",
+        "idempotency_key": "cli-idempotent",
+    }), encoding="utf-8")
+    conflict = _run_cli(tmp_path, "--enqueue", str(changed_file))
+    assert conflict.returncode == 1
+    events = [json.loads(line) for line in conflict.stdout.splitlines()]
+    assert events[-1]["error_code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_cli_enqueue_replays_completed_result(tmp_path):
+    import sqlite3
+
+    assert _run_cli(tmp_path, "--init").returncode == 0
+    conn = sqlite3.connect(tmp_path / "tasks.db")
+    conn.execute("DELETE FROM tasks")
+    conn.commit()
+    conn.close()
+
+    task_file = tmp_path / "replay-result.json"
+    task_file.write_text(json.dumps({
+        "action": "verify_runtime", "language": "python", "min_version": "3.11",
+        "idempotency_key": "cli-replay-result",
+    }), encoding="utf-8")
+    first = json.loads(_run_cli(tmp_path, "--enqueue", str(task_file)).stdout.strip())
+    assert _run_cli(tmp_path, "--once").returncode == 0
+
+    replay = _run_cli(tmp_path, "--enqueue", str(task_file))
+    assert replay.returncode == 0, replay.stderr
+    record = json.loads(replay.stdout.strip())
+    assert record["task_id"] == first["task_id"]
+    assert record["idempotent_replay"] is True
+    assert record["status"] == "completed"
+    assert record["result"]["status"] == "ok"
+    status = _run_cli(tmp_path, "--status", "--json")
+    counts = json.loads(status.stdout.strip())["status_counts"]
+    assert counts == {"completed": 1}
+
+
 def test_policy_denies_unlisted_action(tmp_path, capsys):
     config = make_config(tmp_path)
     config["policy"] = {"allowed_actions": ["verify_runtime"]}
