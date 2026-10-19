@@ -38,11 +38,10 @@ OpenCode performs the following sequence:
 2. Creates `opencode.json` first so future sessions automatically load the protocol.
 3. Creates the required directories and scaffold files.
 4. Writes safe, repository-relative configuration defaults.
-5. Applies the initial SQLite migration.
-6. Seeds the bootstrap task queue.
-7. Compiles and checks the runtime.
-8. Runs the static contract tests when `pytest` is available.
-9. Claims and executes the first queued task.
+5. Runs `python agent.py --init`, which applies the migration, seeds the task queue, and creates workspace directories.
+6. Compiles and checks the runtime.
+7. Runs the static contract tests when `pytest` is available.
+8. Claims and executes the first queued task.
 
 No network access or secrets are required during bootstrap.
 
@@ -54,8 +53,7 @@ sqlite-task-board/
 ├── README.md                      # Project and operator documentation
 ├── opencode.json                  # OpenCode project configuration
 ├── agent.py                       # Runtime entry point
-├── config.example.yaml            # Safe configuration template
-├── config.yaml                    # Active local configuration
+├── config.yaml                    # Single canonical configuration
 ├── requirements.txt               # Runtime and test dependencies
 ├── .gitignore
 ├── migrations/
@@ -92,7 +90,7 @@ Tasks are claimed in this order:
 2. Oldest `created_at`
 3. Lowest task `id`
 
-The claim is guarded by a transaction and a status check so a task cannot be claimed after it has left `pending`.
+The claim update is guarded by a `status='pending'` check so a task cannot be claimed twice after it leaves `pending`.
 
 ## Registered actions
 
@@ -102,8 +100,6 @@ The initial runtime exposes a deliberately small action surface.
 | --- | --- | --- |
 | `verify_runtime` | Confirm a supported runtime meets a minimum version | Fixed language enum, strict version format, subprocess timeout |
 | `create_directories` | Create one or more directories | Workspace boundary, path traversal rejection, item limits |
-| `setup_env_file` | Copy a non-secret environment template | Workspace boundary, explicit overwrite behavior |
-| `install_dependencies` | Install from an approved manifest and registry | Approved manager, registry policy, hashes, timeout |
 | `run_health_check` | Check an allowed HTTP or HTTPS endpoint | Protocol allowlist, host allowlist, short timeout |
 
 Every payload must:
@@ -146,32 +142,37 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Initialize the database with the SQLite CLI:
+Initialize the database, seed the bootstrap queue, and create workspace directories:
+
+```bash
+python agent.py --init
+```
+
+The initializer is idempotent. Re-running it does not duplicate tasks. If the `sqlite3` CLI is preferred, apply the same files in order:
 
 ```bash
 sqlite3 tasks.db < migrations/0001_initial.sql
 sqlite3 tasks.db < seeds/bootstrap_tasks.sql
 ```
 
-Or initialize it with Python when the CLI is not installed:
+## Running the agent
+
+Initialize the database and seed the queue on first run:
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-import sqlite3
-
-with sqlite3.connect("tasks.db") as connection:
-    connection.executescript(Path("migrations/0001_initial.sql").read_text())
-    connection.executescript(Path("seeds/bootstrap_tasks.sql").read_text())
-PY
+python agent.py --init
 ```
-
-## Running the agent
 
 Validate configuration, schema compatibility, and runtime readiness:
 
 ```bash
 python agent.py --check
+```
+
+Show queue counts and the next eligible task:
+
+```bash
+python agent.py --status
 ```
 
 Claim and process at most one task:
@@ -200,16 +201,14 @@ AGENT_CONFIG=./path/to/config.yaml python agent.py --check
 
 ## Configuration
 
-`config.yaml` uses safe local defaults and contains no secrets. Copy `config.example.yaml` when you need to restore the baseline configuration.
+`config.yaml` is the single configuration file and contains no secrets. Every key is read by the runtime; there is no separate example file.
 
 | Section | Controls |
 | --- | --- |
 | `agent` | Workspace, database path, schema version, and protocol version |
-| `task_board` | Default retry limit, claim limit, and replenishment limits |
-| `security` | Write boundary, read-only paths, network allowlist, and package policy |
-| `logging` | Log level, JSONL format, and output destination |
+| `security` | Network allowlist for `run_health_check` |
 
-Repository-relative paths are resolved from the repository root. The runtime refuses to proceed when the configured schema version does not match the applied database migration.
+Repository-relative paths are resolved from the repository root. `--check` emits `SCHEMA_VERSION_MISMATCH` and fails when `agent.schema_version` differs from the applied migration.
 
 ## Security model
 
@@ -218,22 +217,19 @@ Ordinary task execution uses zero-trust defaults.
 ### Filesystem
 
 - Bootstrap may create scaffold files only under the repository root.
-- After bootstrap, task writes must remain inside `security.workspace_boundary`.
+- After bootstrap, task writes must remain inside `agent.workspace`.
 - `..` traversal and absolute paths outside the workspace are rejected.
 - Referenced files are checked before use.
 
 ### Subprocesses
 
 - Commands are passed as argument lists with `shell=False`.
-- Each process receives a minimal environment and a timeout.
-- Standard output and error are captured and truncated to 10 KB.
-- Package installation is limited by manager and registry policy.
+- Subprocess calls use a bounded timeout.
 
 ### Network
 
 - Only HTTP and HTTPS endpoints are accepted.
 - The destination host must match `security.network_allowlist`.
-- Public registries are disabled by default.
 - Bootstrap itself remains offline.
 
 ### Secrets
@@ -253,7 +249,7 @@ The agent writes one JSON object per line to standard output. Every event contai
 {"timestamp":"2026-01-01T10:00:03Z","event":"EXEC_END","task_id":1,"action":"verify_runtime","status":"completed"}
 ```
 
-Required lifecycle events include startup, schema checks, recovery, execution, security alerts, queue replenishment, task release, and graceful shutdown.
+Required lifecycle events include configuration failures, initialization, startup, schema checks, execution, dead-lettering, and graceful shutdown.
 
 ## Retry and recovery
 
@@ -338,7 +334,7 @@ Do not weaken global policy to accommodate one action. Extend the smallest relev
 - `config.yaml` intentionally remains in version control because its defaults contain no secrets.
 - Database files, runtime output, virtual environments, editor metadata, and local secret files are ignored by Git.
 - `workspace/.gitkeep` preserves the writable workspace directory without committing task output.
-- Queue replenishment must remain within the configured batch and daily generation limits.
+- Queue replenishment is not implemented in this version; enqueue work explicitly.
 
 ## Troubleshooting
 
@@ -371,35 +367,3 @@ Review the task and extend the narrowest relevant setting in `config.yaml`. Avoi
 ## Source of truth
 
 This README is an operator guide. If it conflicts with [`AGENTS.md`](./AGENTS.md), the protocol in `AGENTS.md` takes precedence.
-```bash
-python agent.py
-```
-
----
-
-## Runtime Modes
-
-| Command | Purpose |
-|---------|---------|
-| `python agent.py --check` | Validate configuration and runtime readiness |
-| `python agent.py --once` | Execute one queued task |
-| `python agent.py` | Run the continuous task loop |
-| `AGENT_DRY_RUN=true python agent.py --once` | Validate and plan without persisting task changes |
-
----
-
-## Acceptance Criteria
-
-Bootstrap is complete when:
-- Project scaffold exists
-- `opencode.json` references `AGENTS.md`
-- `tasks.db` is initialized and migrated
-- Bootstrap tasks are seeded
-- `python agent.py --check` passes
-
----
-
-## Summary
-
-**One file (`AGENTS.md`) → one command (open in Opencode) → a fully functional SQLite-backed agent runtime.**
-All future work is queued, validated, and executed locally through the task board.

@@ -1,2 +1,23 @@
-# Database
-tasks.db
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Runtime state
+*.db
+*.db-shm
+*.db-wal
+logs/
+workspace/*
+!workspace/.gitkeep
+
+# Agent/tooling state
+.cline-home/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
