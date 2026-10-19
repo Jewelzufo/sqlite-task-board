@@ -86,8 +86,8 @@ def setup_agent(tmpdir):
         "agent": {
             "workspace": str(workspace),
             "database": str(db_path),
-            "schema_version": 1,
-            "protocol_version": "3.1",
+            "schema_version": 3,
+            "protocol_version": "3.2",
         },
         "security": {"network_allowlist": ["127.0.0.1", "localhost"]},
     }
@@ -99,7 +99,7 @@ def test_config_yaml_uses_canonical_schema():
     import yaml
 
     config = yaml.safe_load((ROOT / "config.yaml").read_text())
-    assert set(config) == {"agent", "security"}
+    assert set(config) == {"agent", "security", "policy", "limits"}
     assert set(config["agent"]) == {
         "workspace",
         "database",
@@ -107,6 +107,19 @@ def test_config_yaml_uses_canonical_schema():
         "protocol_version",
     }
     assert config["security"]["network_allowlist"]
+    assert set(config["policy"]) == {
+        "allowed_actions",
+        "allowed_path_roots",
+        "max_payload_bytes",
+    }
+    assert set(config["limits"]) == {
+        "max_task_seconds",
+        "max_output_bytes",
+        "max_tasks_per_window",
+        "max_failures_per_window",
+        "window_seconds",
+        "max_spawn_depth",
+    }
 
 
 def test_schema_creates_tasks_table():
@@ -297,8 +310,8 @@ def test_init_cli_seeds_database():
             "agent:\n"
             f'  workspace: "{workspace}"\n'
             f'  database: "{db_path}"\n'
-            "  schema_version: 1\n"
-            '  protocol_version: "3.1"\n'
+            "  schema_version: 3\n"
+            '  protocol_version: "3.2"\n'
             "security:\n"
             '  network_allowlist: ["127.0.0.1", "localhost"]\n',
             encoding="utf-8",
@@ -333,7 +346,7 @@ def test_check_cli_reports_uninitialized_without_creating_db():
             "agent:\n"
             f'  workspace: "{workspace}"\n'
             f'  database: "{db_path}"\n'
-            "  schema_version: 1\n",
+            "  schema_version: 3\n",
             encoding="utf-8",
         )
         env = os.environ.copy()

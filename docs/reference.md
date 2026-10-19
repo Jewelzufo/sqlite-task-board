@@ -2,6 +2,14 @@
 
 This file contains the detailed schema, event, and error tables referenced by `AGENTS.md` and `README.md`.
 
+## Schema version
+
+Schema version `3` applies `migrations/0001_initial.sql`,
+`0002_idempotency_audit.sql`, and `0003_task_lineage.sql` in order. `--init`
+records each version in `schema_migrations` and skips already-applied files.
+`agent.schema_version` must equal `3`; any other value fails with
+`SCHEMA_VERSION_MISMATCH`.
+
 ## Task states
 
 ```text
@@ -15,6 +23,51 @@ Priorities: `critical`, `high`, `medium`, `low`.
 ## Claim semantics
 
 `Agent.claim_next_task()` uses `BEGIN IMMEDIATE`, selects the oldest highest-priority pending task, increments `attempt_count`, and verifies that the conditional update affected exactly one row before committing. Connections use WAL and a 5-second busy timeout.
+
+## Idempotency
+
+Every validated payload must carry an `idempotency_key`. On success the runtime stores
+`(key, action_type, payload_hash, result_json)` in `idempotency_ledger` in the same
+transaction that marks the task completed. Re-running the same key with the same payload
+replays the stored result without invoking the action again. Reusing the key with a
+different action or payload fails closed with `IDEMPOTENCY_CONFLICT` and is dead-lettered
+immediately. Failed attempts do not populate the ledger, so retries still execute.
+
+## Audit chain
+
+`audit_log` stores every event emitted by the runtime. Each row contains
+`prev_hash` and `entry_hash = sha256(prev_hash + canonical_json(event))`; the genesis
+`prev_hash` is 64 zeros. `taskboard --audit-verify` recomputes the chain and exits `1`
+at the first `prev_hash` or `entry_hash` mismatch. Dry-run does not write audit rows.
+A hash chain detects mutation of stored rows but cannot detect deletion of trailing
+rows unless the head hash is recorded externally.
+
+## Policy and limits
+
+`policy.allowed_actions`, `policy.allowed_path_roots`, and `policy.max_payload_bytes`
+are evaluated after schema validation and before dispatch. Every decision emits
+`POLICY_DECISION` with `rule_id`, `decision`, and `reason`; a denied payload fails with
+the rule's stable code (for example `POLICY_DENIED`, `PATH_TRAVERSAL_ATTEMPT`,
+`UNAPPROVED_HOST`). Denial is not retried.
+
+`limits.max_task_seconds` caps subprocess and HTTP timeouts and is checked after the
+action. `limits.max_output_bytes` caps captured output. `limits.max_tasks_per_window`
+and `limits.max_failures_per_window` are evaluated over `limits.window_seconds` before
+claiming: the first emits `BUDGET_EXCEEDED`, the second opens the circuit with
+`CIRCUIT_OPEN`. Both are deterministic and reset when the window elapses.
+
+## Lineage
+
+`tasks.parent_task_id` and `tasks.depth` record task lineage. `enqueue_task()` rejects a
+missing parent, a depth above `limits.max_spawn_depth`, or a duplicate idempotency key
+with `LINEAGE_INVALID` / `IDEMPOTENCY_CONFLICT`. `--graph --format dot|json` exports the
+lineage; JSON output contains `nodes` and `edges`.
+
+## Replay
+
+`--replay FILE` loads a JSON fixture `{payload, action_type?, workspace?, expect?}`,
+validates it, evaluates policy, and prints `{"ok": ..., "result": ...}`. Replay performs
+no database, filesystem, or network effects.
 
 ## Action schemas
 
@@ -71,6 +124,9 @@ Every lifecycle event is JSONL on stdout and contains `timestamp` and `event`. T
 | `SCHEMA_VERSION_MISMATCH` | Applied and configured schema versions differ |
 | `EXEC_START` | Task claimed and execution started |
 | `EXEC_PLAN` | Dry-run plan produced |
+| `POLICY_DECISION` | Policy allow/deny decision with rule and reason |
+| `BUDGET_EXCEEDED` | Task-window budget exhausted or task exceeded its time budget |
+| `CIRCUIT_OPEN` | Failure threshold reached; claiming is paused for the window |
 | `EXEC_END` | Task completed or scheduled for retry |
 | `EXEC_ERROR` | Task failure with `error_code` |
 | `TASK_DEAD_LETTERED` | Task exhausted retries |
@@ -105,6 +161,12 @@ Every lifecycle event is JSONL on stdout and contains `timestamp` and `event`. T
 | `INIT_FAILED` | Initialization failed |
 | `PYTEST_NOT_AVAILABLE` | Optional pytest checks were skipped |
 | `UNKNOWN_EXCEPTION` | Unclassified runtime failure |
+| `POLICY_DENIED` | Policy rejected an otherwise schema-valid payload |
+| `IDEMPOTENCY_CONFLICT` | Key reused with a different action or payload |
+| `BUDGET_EXCEEDED` | Task or window budget exhausted |
+| `CIRCUIT_OPEN` | Failure breaker is open |
+| `LINEAGE_INVALID` | Parent missing, depth exceeded, or lineage cycle |
+| `AUDIT_INTEGRITY_FAILED` | Audit append or verification failed |
 
 ## Recovery
 
@@ -112,7 +174,7 @@ At startup, `running` tasks with attempts remaining return to `pending` with `st
 
 ## Dry-run
 
-`AGENT_DRY_RUN=true` or `--dry-run` selects the next task without claiming it, validates its payload and security policy, emits `EXEC_PLAN`, and performs no database or filesystem writes.
+`AGENT_DRY_RUN=true` or `--dry-run` selects the next task without claiming it, validates its payload and policy, emits `POLICY_DECISION` and `EXEC_PLAN`, and performs no database or filesystem writes. If the payload was already executed under the same idempotency key, the plan includes `idempotent_replay: true`.
 
 ## Exit codes
 
@@ -120,4 +182,8 @@ At startup, `running` tasks with attempts remaining return to `pending` with `st
 |---|---|
 | `--check` | `0` pass, `1` failure |
 | `--once` | `0` success, `1` task failure, `2` no pending work |
+| `--audit-verify` | `0` intact chain, `1` broken or missing chain |
+| `--graph` | `0` success, `1` database or format failure |
+| `--enqueue` | `0` inserted, `1` validation or database failure |
+| `--replay` | `0` expectation matched, `1` mismatch or unreadable fixture |
 | execution loop | `0` clean shutdown |

@@ -8,9 +8,13 @@ SQLite is the source of task state, [`AGENTS.md`](./AGENTS.md) is the operating 
 
 - Tasks are JSON instructions in SQLite.
 - Payloads pass strict action-specific JSON Schema validation.
-- Only registered actions execute.
+- Only registered actions execute; policy decisions are explicit and traced.
 - Writes stay inside `workspace/`; subprocesses use `shell=False` and timeouts.
 - Network requests require an allowlisted host and `http`/`https`.
+- Successful results are idempotent by key and stored in a replay ledger.
+- Every event is appended to a hash-chained audit log.
+- Deterministic budgets and a failure breaker pause runaway queues.
+- Task lineage supports parent/depth tracking and graph export.
 - Lifecycle and error events are JSONL on stdout.
 - Failed work is retried, then dead-lettered.
 - Claiming is atomic and safe for one worker by default.
@@ -31,7 +35,8 @@ Without installation, use `python agent.py --init|--check|--status|--once`. `--i
 ```text
 AGENTS.md  README.md  opencode.json  agent.py  config.yaml
 pyproject.toml  requirements.txt  Makefile  CHANGELOG.md
-docs/reference.md  migrations/0001_initial.sql  seeds/bootstrap_tasks.sql
+docs/reference.md  migrations/0001_initial.sql  migrations/0002_idempotency_audit.sql
+migrations/0003_task_lineage.sql  seeds/bootstrap_tasks.sql
 tests/test_agent_contract.py  tests/test_behavior.py  workspace/.gitkeep
 ```
 
@@ -75,14 +80,27 @@ The bootstrap health check targets `http://127.0.0.1:0/health`; its failure is i
 agent:
   workspace: "./workspace"
   database: "./tasks.db"
-  schema_version: 1
-  protocol_version: "3.1"
+  schema_version: 3
+  protocol_version: "3.2"
 
 security:
   network_allowlist: ["127.0.0.1", "localhost"]
+
+policy:
+  allowed_actions: ["verify_runtime", "create_directories", "run_health_check"]
+  allowed_path_roots: ["."]
+  max_payload_bytes: 65536
+
+limits:
+  max_task_seconds: 60
+  max_output_bytes: 10240
+  max_tasks_per_window: 100
+  max_failures_per_window: 10
+  window_seconds: 60
+  max_spawn_depth: 3
 ```
 
-Relative paths resolve from the repository root. `AGENT_CONFIG` selects an alternate file. `agent.schema_version` must equal `1`; `security.network_allowlist` must be a non-empty list of hosts.
+Relative paths resolve from the repository root. `AGENT_CONFIG` selects an alternate file. `agent.schema_version` must equal `3`; `security.network_allowlist` must be a non-empty list of hosts. Policy and limits are optional and default to the safe values above.
 
 ## Commands
 
@@ -90,15 +108,19 @@ Relative paths resolve from the repository root. `AGENT_CONFIG` selects an alter
 |---|---|
 | `taskboard --init` | Migrate, seed, and create workspace directories |
 | `taskboard --check` | Validate dependencies, config, workspace, database, and schema |
-| `taskboard --status [--json]` | Show queue counts and the next task |
+| `taskboard --status [--json]` | Show queue counts, next task, and breaker state |
 | `taskboard --once [--dry-run]` | Execute or plan one task |
+| `taskboard --audit-verify` | Verify the hash-chained audit log |
+| `taskboard --graph [--format dot\|json]` | Export task lineage |
+| `taskboard --enqueue FILE` | Validate and enqueue a JSON payload |
+| `taskboard --replay FILE` | Replay a fixture without side effects |
 | `taskboard` | Run the continuous worker |
 
 `--once` exit codes: `0` success, `1` task failure, `2` no pending work.
 
 ## Dry run
 
-`AGENT_DRY_RUN=true taskboard --once` or `taskboard --once --dry-run` selects and validates the next task without claiming it, creates no files, makes no network requests, and performs no database writes. It emits `EXEC_PLAN` and leaves the task pending.
+`AGENT_DRY_RUN=true taskboard --once` or `taskboard --once --dry-run` selects and validates the next task without claiming it, creates no files, makes no network requests, writes no ledger or audit rows, and performs no database writes. It emits `POLICY_DECISION` and `EXEC_PLAN`, and leaves the task pending.
 
 ## Tests and CI
 
@@ -114,9 +136,11 @@ ruff check .
 
 - SQLite is authoritative; `tasks.db` is generated and ignored by Git.
 - `AGENTS.md` is authoritative if documentation conflicts; `workspace/` output is disposable.
-- Queue replenishment is not implemented; enqueue work explicitly. Logs are JSONL on stdout; human progress goes to stderr.
+- Queue replenishment is not implemented; enqueue work explicitly with `--enqueue`. Logs are JSONL on stdout; human progress goes to stderr.
 - Missing PyYAML/jsonschema: run `python -m pip install -r requirements.txt`; the runtime fails closed.
 - Task stuck in `running`: restart the agent; recovery returns it to `pending` or dead-letters it.
+- Repeated failures: inspect `--status` for `circuit_open` and raise `limits.max_failures_per_window` only with a reason.
+- Suspected log tampering: run `--audit-verify`; exit `1` identifies the first broken sequence.
 - Health check failure is expected for the bootstrap port `0` endpoint. Extend only the narrowest allowlist or workspace setting for real work.
 
 ## License

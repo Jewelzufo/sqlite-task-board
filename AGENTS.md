@@ -48,6 +48,8 @@ sqlite-task-board/
 ├── CHANGELOG.md
 ├── .gitignore
 ├── migrations/0001_initial.sql
+├── migrations/0002_idempotency_audit.sql
+├── migrations/0003_task_lineage.sql
 ├── seeds/bootstrap_tasks.sql
 ├── docs/reference.md
 ├── docs/ci-workflow.yml
@@ -85,21 +87,41 @@ sqlite-task-board/
 agent:
   workspace: "./workspace"
   database: "./tasks.db"
-  schema_version: 1
-  protocol_version: "3.1"
+  schema_version: 3
+  protocol_version: "3.2"
 
 security:
   network_allowlist:
     - "127.0.0.1"
     - "localhost"
+
+policy:
+  allowed_actions:
+    - "verify_runtime"
+    - "create_directories"
+    - "run_health_check"
+  allowed_path_roots:
+    - "."
+  max_payload_bytes: 65536
+
+limits:
+  max_task_seconds: 60
+  max_output_bytes: 10240
+  max_tasks_per_window: 100
+  max_failures_per_window: 10
+  window_seconds: 60
+  max_spawn_depth: 3
 ```
 
 Rules:
 
 - Relative paths resolve from `REPO_ROOT`.
 - `AGENT_CONFIG` overrides the config path.
-- `agent.schema_version` must equal `1`.
+- `agent.schema_version` must equal `3`; `agent.protocol_version` is `3.2`.
 - `security.network_allowlist` must be a non-empty list of host strings.
+- `policy.allowed_actions` defaults to every registered action; a configured list must name only registered actions.
+- `policy.allowed_path_roots` are workspace-relative and must not be absolute or contain `..`.
+- `limits` are deterministic integers; unknown keys fail closed.
 - Unknown top-level keys produce a warning and are ignored.
 - The file contains no secrets and remains tracked in Git.
 
@@ -107,10 +129,14 @@ Rules:
 
 ## 5. Database schema
 
-The migration is `migrations/0001_initial.sql`. It creates:
+The migrations are `migrations/0001_initial.sql`, `0002_idempotency_audit.sql`, and
+`0003_task_lineage.sql`. They create:
 
-- `tasks`: task state, priority, retries, timestamps, and error fields;
-- `schema_migrations`: applied schema version;
+- `tasks`: task state, priority, retries, timestamps, error fields, and lineage
+  (`parent_task_id`, `depth`);
+- `schema_migrations`: applied schema versions;
+- `idempotency_ledger`: key, action, payload hash, result, and completion time;
+- `audit_log`: append-only, hash-chained lifecycle events;
 - `task_generation_log`: reserved for future replenishment.
 
 Task states:
@@ -118,7 +144,7 @@ Task states:
 ```text
 pending -> running -> completed
                  -> pending        retriable failure
-                 -> dead-lettered  final failure
+                 -> dead-lettered  final or non-retriable failure
 ```
 
 Priority order: `critical`, `high`, `medium`, `low`.
@@ -126,6 +152,10 @@ Priority order: `critical`, `high`, `medium`, `low`.
 ### Atomic claim
 
 The runtime uses `BEGIN IMMEDIATE`, selects the oldest highest-priority eligible pending task, increments `attempt_count`, and requires the conditional update to affect exactly one row before committing. Connections use WAL and `PRAGMA busy_timeout=5000`.
+
+### Idempotency
+
+A successful action writes its result to `idempotency_ledger` in the same transaction that marks the task completed. Replaying the same key and payload returns the stored result without re-executing. Reusing a key with a different action or payload fails with `IDEMPOTENCY_CONFLICT` and is dead-lettered immediately. Failed attempts are not recorded.
 
 ---
 
@@ -139,10 +169,15 @@ The runtime uses `BEGIN IMMEDIATE`, selects the oldest highest-priority eligible
 - claim tasks atomically;
 - validate JSON with action-specific schemas;
 - enforce workspace and network boundaries;
+- evaluate `policy.allowed_actions`, `policy.allowed_path_roots`, and `policy.max_payload_bytes` before dispatch;
+- enforce `limits` and the deterministic failure breaker;
+- record successful results in `idempotency_ledger` and replay them by key;
+- append every event to the hash-chained `audit_log`;
 - execute only actions in `ACTION_REGISTRY`;
 - persist a stable `error_code` on failure;
 - emit JSONL events on stdout and human progress on stderr;
-- support `--init`, `--check`, `--status`, `--once`, `--dry-run`, and continuous mode;
+- support `--init`, `--check`, `--status`, `--once`, `--dry-run`, `--audit-verify`,
+  `--graph`, `--enqueue`, `--replay`, and continuous mode;
 - support `AGENT_DRY_RUN=true`;
 - close cleanly on SIGINT or SIGTERM.
 
@@ -194,13 +229,23 @@ Full schemas and examples are in `docs/reference.md`. `ACTION_SCHEMAS` in `agent
 - Do not write secrets into generated files.
 - Redact keys containing `password`, `secret`, `token`, `credential`, or `api_key`.
 
+### Policy and audit
+
+- Policy evaluation happens after schema validation and before dispatch.
+- Policy decisions are deterministic and emit `POLICY_DECISION`; denial is not retried.
+- `--audit-verify` recomputes `sha256(prev_hash + canonical_json(event))` for every row
+  and fails at the first broken link.
+- Audit writes are skipped in dry-run so the command remains side-effect free.
+- Resource limits and the breaker are computed from persisted timestamps, never from a
+  model or a statistical baseline.
+
 ---
 
 ## 9. Events and errors
 
 Every event is JSONL on stdout with `timestamp` and `event`. Task-scoped events include `task_id`.
 
-Required events: `CONFIG_LOAD_FAILED`, `INIT_COMPLETE`, `STARTUP`, `SCHEMA_CHECK_OK`, `SCHEMA_VERSION_MISMATCH`, `EXEC_START`, `EXEC_PLAN`, `EXEC_END`, `EXEC_ERROR`, `TASK_DEAD_LETTERED`, `SHUTDOWN_REQUESTED`, `SHUTDOWN_COMPLETE`.
+Required events: `CONFIG_LOAD_FAILED`, `INIT_COMPLETE`, `STARTUP`, `SCHEMA_CHECK_OK`, `SCHEMA_VERSION_MISMATCH`, `EXEC_START`, `EXEC_PLAN`, `POLICY_DECISION`, `EXEC_END`, `EXEC_ERROR`, `BUDGET_EXCEEDED`, `CIRCUIT_OPEN`, `TASK_DEAD_LETTERED`, `SHUTDOWN_REQUESTED`, `SHUTDOWN_COMPLETE`.
 
 `EXEC_ERROR` must include `task_id`, `error_code`, and `error`. Task failures persist `error_code` in SQLite. The complete error code table is in `docs/reference.md`.
 
@@ -216,7 +261,9 @@ At startup:
 On failure:
 
 - below the limit: `pending` with `error_code` and `last_error`;
-- at the limit: `dead-lettered` with `error_code`, `last_error`, and `failed_at`.
+- at the limit: `dead-lettered` with `error_code`, `last_error`, and `failed_at`;
+- `IDEMPOTENCY_CONFLICT`, `POLICY_DENIED`, `LINEAGE_INVALID`, and `BUDGET_EXCEEDED`
+  are non-retriable and dead-letter immediately.
 
 There is no mandatory inter-retry delay.
 
@@ -227,10 +274,12 @@ There is no mandatory inter-retry delay.
 `AGENT_DRY_RUN=true` or `--dry-run` must:
 
 - select the next task without claiming it;
-- validate its payload and security policy;
-- emit `EXEC_PLAN` with `dry_run: true`;
+- validate its payload and policy;
+- emit `POLICY_DECISION` and `EXEC_PLAN` with `dry_run: true`;
+- include `idempotent_replay: true` when the key already has a stored result;
 - create no files;
 - make no network requests;
+- write no audit or ledger rows;
 - leave task state and `attempt_count` unchanged.
 
 The same task remains visible for the next dry-run until the queue changes.
@@ -257,6 +306,11 @@ Acceptance criteria:
 - `--check` exits 0 and `--status` reports the queue;
 - claiming is atomic and the race test passes;
 - failures persist a documented `error_code` and emit `EXEC_ERROR`;
+- idempotent replay executes the action once and returns the stored result;
+- policy decisions are emitted for allow and deny, including dry-run;
+- `--audit-verify` detects tampering at the correct sequence number;
+- budgets and the breaker are deterministic under an injected window;
+- lineage rejects missing parents and depth overflow;
 - dry-run has no side effects;
 - health checks reject unapproved hosts, protocols, and redirects;
 - tests and lint pass via `scripts/ci.sh` and the `docs/ci-workflow.yml` template;
