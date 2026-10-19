@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
 
 # Runtime state
 *.db
