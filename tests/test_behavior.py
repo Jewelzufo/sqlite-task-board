@@ -22,8 +22,8 @@ def make_config(tmp_path, allowlist=None):
         "agent": {
             "workspace": str(workspace),
             "database": str(tmp_path / "tasks.db"),
-            "schema_version": 1,
-            "protocol_version": "3.1",
+            "schema_version": 3,
+            "protocol_version": "3.2",
         },
         "security": {
             "network_allowlist": ["127.0.0.1", "localhost"]
@@ -230,7 +230,7 @@ def test_status_json_contract(agent, capsys):
                 "verify_runtime")
     assert agent.status(as_json=True) is True
     payload = json.loads(capsys.readouterr().out.strip())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 3
     assert payload["status_counts"]["pending"] == 1
     assert payload["next_task_id"] is not None
 
@@ -285,8 +285,8 @@ def _run_cli(tmp_path, *args):
         "agent:\n"
         f'  workspace: "{workspace}"\n'
         f'  database: "{tmp_path / "tasks.db"}"\n'
-        "  schema_version: 1\n"
-        '  protocol_version: "3.1"\n'
+        "  schema_version: 3\n"
+        '  protocol_version: "3.2"\n'
         "security:\n"
         '  network_allowlist: ["127.0.0.1", "localhost"]\n',
         encoding="utf-8",
@@ -353,7 +353,7 @@ def test_opencode_allows_bash_for_bootstrap():
     assert payload["permission"]["bash"] == "allow"
 
 
-def _write_config(tmp_path, schema_version=1, extra=""):
+def _write_config(tmp_path, schema_version=3, extra=""):
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     path = tmp_path / "config.yaml"
@@ -362,7 +362,7 @@ def _write_config(tmp_path, schema_version=1, extra=""):
         f'  workspace: "{workspace}"\n'
         f'  database: "{tmp_path / "tasks.db"}"\n'
         f"  schema_version: {schema_version}\n"
-        '  protocol_version: "3.1"\n'
+        '  protocol_version: "3.2"\n'
         "security:\n"
         '  network_allowlist: ["127.0.0.1", "localhost"]\n' + extra,
         encoding="utf-8",
@@ -396,7 +396,7 @@ def test_main_uninitialized_and_dry_run_paths(tmp_path, monkeypatch):
         "agent:\n"
         f'  workspace: "{uninitialized}"\n'
         f'  database: "{uninitialized / "tasks.db"}"\n'
-        "  schema_version: 1\n"
+        "  schema_version: 3\n"
         "security:\n"
         '  network_allowlist: ["127.0.0.1"]\n',
         encoding="utf-8",
@@ -454,9 +454,22 @@ def test_load_config_validation_branches(tmp_path):
         ("foo: bar\n", "CONFIG_LOAD_FAILED"),
         ("agent: []\n", "CONFIG_LOAD_FAILED"),
         ("agent:\n  schema_version: nope\n", "CONFIG_LOAD_FAILED"),
-        ("agent:\n  schema_version: 1\n  workspace: 5\n", "CONFIG_LOAD_FAILED"),
-        ("agent:\n  schema_version: 1\nsecurity: []\n", "CONFIG_LOAD_FAILED"),
-        ("agent:\n  schema_version: 1\nsecurity:\n  network_allowlist: []\n",
+        ("agent:\n  schema_version: 3\n  workspace: 5\n", "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\nsecurity: []\n", "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\nsecurity:\n  network_allowlist: []\n",
+         "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\npolicy: []\n", "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\npolicy:\n  allowed_actions: []\n",
+         "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\npolicy:\n  allowed_actions: [bogus]\n",
+         "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\npolicy:\n  allowed_path_roots: [/tmp]\n",
+         "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\npolicy:\n  max_payload_bytes: nope\n",
+         "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\nlimits: []\n", "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\nlimits:\n  unknown: 1\n", "CONFIG_LOAD_FAILED"),
+        ("agent:\n  schema_version: 3\nlimits:\n  window_seconds: 0\n",
          "CONFIG_LOAD_FAILED"),
     ]
     for index, (text, code) in enumerate(cases):
@@ -517,3 +530,260 @@ def test_main_no_work_exit_code(tmp_path, monkeypatch):
     assert agent_module.main() == 0
     assert agent_module.main() == 1
     assert agent_module.main() == 2
+
+
+def test_idempotency_replay_skips_side_effect(agent, monkeypatch):
+    calls = []
+    original = agent_module.ACTION_REGISTRY["verify_runtime"]
+
+    def counting(payload):
+        calls.append(payload["idempotency_key"])
+        return original(payload)
+
+    monkeypatch.setitem(agent_module.ACTION_REGISTRY, "verify_runtime", counting)
+    payload = {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+               "idempotency_key": "replay-once"}
+    insert_task(agent, payload, "verify_runtime")
+    assert agent.run_once() is True
+    agent.conn.execute(
+        "UPDATE tasks SET status='pending', attempt_count=0, started_at=NULL WHERE id=1"
+    )
+    agent.conn.commit()
+    assert agent.run_once() is True
+    assert calls == ["replay-once"]
+    row = task_row(agent)
+    assert row["status"] == "completed"
+    ledger = agent.conn.execute("SELECT COUNT(*) FROM idempotency_ledger").fetchone()[0]
+    assert ledger == 1
+
+
+def test_idempotency_conflict_is_dead_lettered(agent):
+    payload = {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+               "idempotency_key": "conflict-key"}
+    insert_task(agent, payload, "verify_runtime")
+    assert agent.run_once() is True
+    changed = dict(payload, min_version="3.12")
+    agent.conn.execute(
+        "UPDATE tasks SET status='pending', attempt_count=0, started_at=NULL, "
+        "instruction=? WHERE id=1",
+        (json.dumps(changed),),
+    )
+    agent.conn.commit()
+    assert agent.run_once() is False
+    row = task_row(agent)
+    assert row["status"] == "dead-lettered"
+    assert row["error_code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_policy_denies_unlisted_action(tmp_path, capsys):
+    config = make_config(tmp_path)
+    config["policy"] = {"allowed_actions": ["verify_runtime"]}
+    instance = Agent(config=config)
+    try:
+        insert_task(
+            instance,
+            {"action": "create_directories", "paths": ["nope"],
+             "idempotency_key": "policy-deny"},
+            "create_directories",
+        )
+        assert instance.run_once() is False
+        row = task_row(instance)
+        assert row["status"] == "dead-lettered"
+        assert row["error_code"] == "POLICY_DENIED"
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        decisions = [event for event in events if event["event"] == "POLICY_DECISION"]
+        assert decisions and decisions[0]["decision"] == "deny"
+    finally:
+        instance.conn.close()
+
+
+def test_policy_payload_size_limit(tmp_path):
+    config = make_config(tmp_path)
+    config["policy"] = {"max_payload_bytes": 40}
+    instance = Agent(config=config)
+    try:
+        insert_task(
+            instance,
+            {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+             "idempotency_key": "too-big"},
+            "verify_runtime",
+        )
+        assert instance.run_once() is False
+        row = task_row(instance)
+        assert row["error_code"] == "POLICY_DENIED"
+    finally:
+        instance.conn.close()
+
+
+def test_governor_blocks_task_window(tmp_path, capsys):
+    config = make_config(tmp_path)
+    config["limits"] = {"max_tasks_per_window": 1}
+    instance = Agent(config=config)
+    try:
+        insert_task(instance, {"action": "verify_runtime", "language": "python",
+                               "min_version": "3.11", "idempotency_key": "window-1"},
+                    "verify_runtime", key="window-1")
+        insert_task(instance, {"action": "verify_runtime", "language": "python",
+                               "min_version": "3.11", "idempotency_key": "window-2"},
+                    "verify_runtime", key="window-2")
+        assert instance.run_once() is True
+        assert instance.run_once() is False
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert any(event["event"] == "BUDGET_EXCEEDED" for event in events)
+    finally:
+        instance.conn.close()
+
+
+
+def test_circuit_breaker_opens_after_failures(tmp_path, capsys):
+    config = make_config(tmp_path)
+    config["limits"] = {"max_failures_per_window": 1}
+    instance = Agent(config=config)
+    try:
+        insert_task(instance, {"action": "bogus", "idempotency_key": "breaker-fail"},
+                    "bogus", max_attempts=1, key="breaker-fail")
+        assert instance.run_once() is False
+        insert_task(instance, {"action": "verify_runtime", "language": "python",
+                               "min_version": "3.11", "idempotency_key": "breaker-ok"},
+                    "verify_runtime", key="breaker-ok")
+        assert instance.run_once() is False
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert any(event["event"] == "CIRCUIT_OPEN" for event in events)
+    finally:
+        instance.conn.close()
+
+
+def test_lineage_validation_and_graph(tmp_path):
+    config = make_config(tmp_path)
+    config["limits"] = {"max_spawn_depth": 1}
+    instance = Agent(config=config)
+    try:
+        parent = instance.enqueue_task(
+            "verify_runtime",
+            {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+             "idempotency_key": "lineage-parent"},
+        )
+        child = instance.enqueue_task(
+            "verify_runtime",
+            {"action": "verify_runtime", "language": "python", "min_version": "3.11",
+             "idempotency_key": "lineage-child"},
+            parent_task_id=parent,
+        )
+        with pytest.raises(TaskError) as exc:
+            instance.enqueue_task(
+                "verify_runtime",
+                {"action": "verify_runtime", "language": "python",
+                 "min_version": "3.11", "idempotency_key": "lineage-grandchild"},
+                parent_task_id=child,
+            )
+        assert exc.value.code == "LINEAGE_INVALID"
+        with pytest.raises(TaskError) as exc:
+            instance.enqueue_task(
+                "verify_runtime",
+                {"action": "verify_runtime", "language": "python",
+                 "min_version": "3.11", "idempotency_key": "lineage-orphan"},
+                parent_task_id=9999,
+            )
+        assert exc.value.code == "LINEAGE_INVALID"
+        result = instance.graph(fmt="json")
+        assert result["edges"] == [{"from": parent, "to": child}]
+        assert len(result["nodes"]) == 2
+    finally:
+        instance.conn.close()
+
+
+def test_audit_verify_detects_tampering(agent):
+    insert_task(agent, {"action": "verify_runtime", "language": "python",
+                        "min_version": "3.11", "idempotency_key": "audit"},
+                "verify_runtime")
+    assert agent.run_once() is True
+    assert agent.audit_verify()["ok"] is True
+    agent.conn.execute(
+        "UPDATE audit_log SET payload_json='{\"event\":\"TAMPERED\"}' WHERE seq=1"
+    )
+    agent.conn.commit()
+    result = agent.audit_verify()
+    assert result["ok"] is False
+    assert result["seq"] == 1
+
+
+def test_cli_innovation_commands(tmp_path):
+    assert _run_cli(tmp_path, "--init").returncode == 0
+    task_file = tmp_path / "task.json"
+    task_file.write_text(json.dumps({
+        "action": "verify_runtime", "language": "python", "min_version": "3.11",
+        "idempotency_key": "cli-enqueue",
+    }), encoding="utf-8")
+    enqueued = _run_cli(tmp_path, "--enqueue", str(task_file))
+    assert enqueued.returncode == 0, enqueued.stderr
+    assert json.loads(enqueued.stdout.strip())["task_id"] >= 1
+
+    graph = _run_cli(tmp_path, "--graph", "--format", "json")
+    assert graph.returncode == 0, graph.stderr
+    assert "nodes" in json.loads(graph.stdout.strip())
+
+    audit = _run_cli(tmp_path, "--audit-verify")
+    assert audit.returncode == 0, audit.stdout + audit.stderr
+    assert json.loads(audit.stdout.strip())["ok"] is True
+
+    fixture = tmp_path / "replay.json"
+    fixture.write_text(json.dumps({
+        "payload": {"action": "verify_runtime", "language": "python",
+                    "min_version": "3.11", "idempotency_key": "cli-replay"},
+        "expect": {"decision": "allow"},
+    }), encoding="utf-8")
+    replay = _run_cli(tmp_path, "--replay", str(fixture))
+    assert replay.returncode == 0, replay.stdout + replay.stderr
+    assert json.loads(replay.stdout.strip())["ok"] is True
+
+
+def test_replay_fixture_decisions(tmp_path, capsys):
+    config = make_config(tmp_path)
+    allow_fixture = tmp_path / "allow.json"
+    allow_fixture.write_text(json.dumps({
+        "payload": {"action": "verify_runtime", "language": "python",
+                    "min_version": "3.11", "idempotency_key": "replay-allow"},
+        "expect": {"decision": "allow"},
+    }), encoding="utf-8")
+    assert agent_module.replay_fixture(allow_fixture, config) is True
+    assert json.loads(capsys.readouterr().out.strip())["ok"] is True
+
+    deny_fixture = tmp_path / "deny.json"
+    deny_fixture.write_text(json.dumps({
+        "payload": {"action": "create_directories", "paths": ["../escape"],
+                    "idempotency_key": "replay-deny"},
+        "expect": {"decision": "deny", "error_code": "PATH_TRAVERSAL_ATTEMPT"},
+    }), encoding="utf-8")
+    assert agent_module.replay_fixture(deny_fixture, config) is True
+    assert json.loads(capsys.readouterr().out.strip())["ok"] is True
+
+
+
+
+def test_migrations_apply_incrementally(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "upgrade.db"
+    migration = (ROOT / "migrations" / "0001_initial.sql").read_text(encoding="utf-8")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(migration)
+    conn.commit()
+    conn.close()
+
+    instance = Agent(config=make_config(tmp_path), auto_init=True)
+    try:
+        versions = [
+            row[0] for row in instance.conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        assert versions == [1, 2, 3]
+        columns = {
+            row["name"] for row in instance.conn.execute("PRAGMA table_info(tasks)")
+        }
+        assert {"parent_task_id", "depth"}.issubset(columns)
+        assert instance._table_exists("idempotency_ledger")
+        assert instance._table_exists("audit_log")
+        assert instance._schema_version_matches()
+    finally:
+        instance.conn.close()
